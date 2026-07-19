@@ -30,7 +30,7 @@ RT_TABLE="200"
 IPSET4="youtube"
 IPSET6="youtube6"
 AGH_YAML="${AGH_YAML:-/opt/AdGuardHome/AdGuardHome.yaml}"
-YT_DOMAINS="youtube.com,youtu.be,googlevideo.com,ytimg.com,ggpht.com"
+YT_DOMAINS="youtube.com,youtu.be,googlevideo.com,ytimg.com,ggpht.com,youtubei.googleapis.com,youtube.googleapis.com,youtube-nocookie.com"
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; RST=$'\e[0m'
 info() { echo "${GRN}[+]${RST} $*"; }
