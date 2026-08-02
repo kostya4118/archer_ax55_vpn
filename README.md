@@ -176,6 +176,10 @@ vi /etc/sing-box/config.json
   "route": {
     "rules": [
       {
+        "protocol": "bittorrent",
+        "outbound": "direct"
+      },
+      {
         "rule_set": "geosite-ru",
         "outbound": "direct"
       },
@@ -257,6 +261,7 @@ curl -v https://ya.ru 2>&1 | grep "Connected to"
 
 | Трафик | Путь |
 |--------|------|
+| BitTorrent | Напрямую |
 | Российские домены (geosite-ru) | Напрямую |
 | Российские IP (geoip-ru) | Напрямую |
 | Локальная сеть (192.168.x.x) | Напрямую |
@@ -308,6 +313,30 @@ cat /var/log/sing-box.log
 ```
 
 И поменяй `"final": "proxy"` на `"final": "direct"`.
+
+## Дополнительно: торрент-трафик напрямую (без VPN)
+
+Если VLESS-сервер блокирует BitTorrent или есть лимит трафика — торренты можно пустить напрямую, минуя VPN.
+
+В конфиге правило `bittorrent` должно стоять **первым** в списке `rules`:
+
+```json
+"route": {
+  "rules": [
+    {
+      "protocol": "bittorrent",
+      "outbound": "direct"
+    },
+    {
+      "rule_set": "geosite-ru",
+      "outbound": "direct"
+    },
+    ...
+  ]
+}
+```
+
+sing-box определяет BitTorrent автоматически благодаря `"sniff": true` в inbound — дополнительных настроек не нужно. Правило срабатывает на DHT, магнет-ссылки и обычные .torrent соединения.
 
 ## Дополнительно: доступ из внешней сети (с телефона на улице)
 
