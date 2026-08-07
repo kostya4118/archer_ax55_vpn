@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# vless-youtube-exit.sh — пустить YouTube-трафик через VLESS-ключ вместо
-# отдельного VPS (замена wgnoads).
+# vless-youtube-exit.sh — пустить YouTube-трафик через готовый ключ (VLESS или
+# Shadowsocks/Outline) вместо отдельного VPS (замена wgnoads).
 #
-# Идея: VLESS — прокси-протокол, его нельзя напрямую подставить в маршрут.
-# Поэтому поднимаем sing-box с TUN-инбаундом: он создаёт интерфейс singbox0,
-# всё попавшее туда уходит в VLESS. Существующая схема
+# Идея: и VLESS, и Shadowsocks — прокси-протоколы, их нельзя напрямую
+# подставить в таблицу маршрутизации. Поэтому поднимаем sing-box с
+# TUN-инбаундом: он создаёт интерфейс singbox0, всё попавшее туда уходит в
+# прокси. Существующая схема
 #   AdGuard(dns.ipset) -> ipset youtube -> iptables MARK -> ip rule fwmark
 # остаётся без изменений, меняется только устройство в таблице 200.
 #
@@ -13,13 +14,15 @@
 #
 # Запуск:
 #   sudo bash vless-youtube-exit.sh 'vless://UUID@host:443?security=reality&...'
+#   sudo bash vless-youtube-exit.sh 'ss://BASE64@host:port#Outline-key'
 # Ключ можно передать и переменной:
-#   sudo VLESS_URL='vless://...' bash vless-youtube-exit.sh
+#   sudo PROXY_URL='vless://...' bash vless-youtube-exit.sh
 #
 set -euo pipefail
 
-# Заголовок Host для ws/httpupgrade. Нужен, когда сервер за CDN/реверс-прокси
-# и в ключе нет параметра host= (симптом: "unexpected HTTP response status: 404").
+# Заголовок Host для ws/httpupgrade (VLESS). Нужен, когда сервер за
+# CDN/реверс-прокси и в ключе нет параметра host= (симптом: "unexpected HTTP
+# response status: 404").
 VLESS_HOST="${VLESS_HOST:-}"
 TUN_IF="${TUN_IF:-singbox0}"
 TUN_ADDR="${TUN_ADDR:-172.19.0.1/30}"
@@ -36,13 +39,17 @@ err()  { echo "${RED}[x]${RST} $*" >&2; }
 
 [[ "${EUID}" -ne 0 ]] && { err "Запусти с sudo"; exit 1; }
 
-VLESS_URL="${1:-${VLESS_URL:-}}"
-if [[ -z "${VLESS_URL}" ]]; then
-  err "Не передан VLESS-ключ."
+PROXY_URL="${1:-${PROXY_URL:-${VLESS_URL:-}}}"
+if [[ -z "${PROXY_URL}" ]]; then
+  err "Не передан ключ."
   echo "  sudo bash $0 'vless://UUID@host:443?security=reality&pbk=...&sni=...'"
+  echo "  sudo bash $0 'ss://BASE64@host:port#Outline-key'"
   exit 1
 fi
-[[ "${VLESS_URL}" == vless://* ]] || { err "Ключ должен начинаться с vless://"; exit 1; }
+case "${PROXY_URL}" in
+  vless://*|ss://*) ;;
+  *) err "Ключ должен начинаться с vless:// или ss://"; exit 1 ;;
+esac
 
 # --- 1. Проверяем, что базовая схема уже настроена ---------------------------
 if ! ipset list youtube >/dev/null 2>&1; then
@@ -57,71 +64,132 @@ if ! command -v sing-box >/dev/null 2>&1; then
 fi
 command -v sing-box >/dev/null 2>&1 || { err "sing-box не установился"; exit 1; }
 
-# --- 3. Генерируем конфиг из vless:// ---------------------------------------
-info "Разбираю VLESS-ключ и генерирую конфиг..."
+# --- 3. Генерируем конфиг из ключа -------------------------------------------
+info "Разбираю ключ и генерирую конфиг..."
 mkdir -p "${CONF_DIR}"
-python3 - "${VLESS_URL}" "${CONF_DIR}/config.json" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" "${VLESS_HOST}" <<'PYEOF'
-import json, re, sys, urllib.parse as up
+python3 - "${PROXY_URL}" "${CONF_DIR}/config.json" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" "${VLESS_HOST}" <<'PYEOF'
+import base64, json, re, sys, urllib.parse as up
 
 url, out_path, tun_if, tun_addr, tun_mtu, host_override = sys.argv[1:7]
-u = up.urlparse(url)
-uuid = up.unquote(u.username or "")
-host, port = u.hostname, u.port or 443
-if not uuid or not host:
-    sys.exit("Не удалось разобрать ключ: нет UUID или адреса сервера")
-q = dict(up.parse_qsl(u.query))
 
-# path вытаскиваем регуляркой, а не через parse_qsl: в ключах он часто записан
-# незакодированным (path=/?ed=2560), и разбор query-строки обрубил бы его на "/".
-_m = re.search(r'(?:^|&)path=([^&]*)', u.query)
-path = up.unquote(_m.group(1)) if _m else "/"
+def b64pad(s: str) -> str:
+    return s + "=" * (-len(s) % 4)
 
-sec = q.get("security", "none")
-net = q.get("type", "tcp")
-if net in ("xhttp", "splithttp"):
-    sys.exit("Транспорт xhttp/splithttp умеет только xray-core, sing-box — нет.\n"
-             "Нужен другой ключ или связка на базе xray.")
+def b64decode(s: str) -> bytes:
+    for fn in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            return fn(b64pad(s))
+        except Exception:
+            continue
+    raise ValueError(f"не удалось декодировать base64: {s!r}")
 
-ob = {"type": "vless", "tag": "vless-out",
-      "server": host, "server_port": int(port), "uuid": uuid}
-if q.get("flow"):
-    ob["flow"] = q["flow"]
-if q.get("encryption") and q["encryption"] != "none":
-    ob["encryption"] = q["encryption"]
+if url.startswith("vless://"):
+    u = up.urlparse(url)
+    uuid = up.unquote(u.username or "")
+    host, port = u.hostname, u.port or 443
+    if not uuid or not host:
+        sys.exit("Не удалось разобрать ключ: нет UUID или адреса сервера")
+    q = dict(up.parse_qsl(u.query))
 
-if sec in ("tls", "reality", "xtls"):
-    tls = {"enabled": True, "server_name": q.get("sni") or q.get("host") or host}
-    if q.get("fp"):
-        tls["utls"] = {"enabled": True, "fingerprint": q["fp"]}
-    if q.get("alpn"):
-        tls["alpn"] = q["alpn"].split(",")
-    if sec == "reality":
-        tls["reality"] = {"enabled": True,
-                          "public_key": q.get("pbk", ""),
-                          "short_id": q.get("sid", "")}
-    if q.get("allowInsecure") in ("1", "true"):
-        tls["insecure"] = True
-    ob["tls"] = tls
+    # path вытаскиваем регуляркой, а не через parse_qsl: в ключах он часто
+    # записан незакодированным (path=/?ed=2560), и разбор query-строки
+    # обрубил бы его на "/".
+    _m = re.search(r'(?:^|&)path=([^&]*)', u.query)
+    path = up.unquote(_m.group(1)) if _m else "/"
 
-ws_host = host_override or q.get("host")
-if net == "ws":
-    tr = {"type": "ws", "path": path}
-    if ws_host:
-        tr["headers"] = {"Host": ws_host}
-    # ?ed=N — ранние данные (V2Ray early data), sing-box задаёт их отдельно
-    _ed = re.search(r'[?&]ed=(\d+)', path)
-    if _ed:
-        tr["path"] = path.split("?")[0]
-        tr["max_early_data"] = int(_ed.group(1))
-        tr["early_data_header_name"] = "Sec-WebSocket-Protocol"
-    ob["transport"] = tr
-elif net == "grpc":
-    ob["transport"] = {"type": "grpc", "service_name": q.get("serviceName", "")}
-elif net == "httpupgrade":
-    tr = {"type": "httpupgrade", "path": path}
-    if ws_host:
-        tr["host"] = ws_host
-    ob["transport"] = tr
+    sec = q.get("security", "none")
+    net = q.get("type", "tcp")
+    if net in ("xhttp", "splithttp"):
+        sys.exit("Транспорт xhttp/splithttp умеет только xray-core, sing-box — нет.\n"
+                 "Нужен другой ключ или связка на базе xray.")
+
+    ob = {"type": "vless", "tag": "proxy-out",
+          "server": host, "server_port": int(port), "uuid": uuid}
+    if q.get("flow"):
+        ob["flow"] = q["flow"]
+    if q.get("encryption") and q["encryption"] != "none":
+        ob["encryption"] = q["encryption"]
+
+    if sec in ("tls", "reality", "xtls"):
+        tls = {"enabled": True, "server_name": q.get("sni") or q.get("host") or host}
+        if q.get("fp"):
+            tls["utls"] = {"enabled": True, "fingerprint": q["fp"]}
+        if q.get("alpn"):
+            tls["alpn"] = q["alpn"].split(",")
+        if sec == "reality":
+            tls["reality"] = {"enabled": True,
+                              "public_key": q.get("pbk", ""),
+                              "short_id": q.get("sid", "")}
+        if q.get("allowInsecure") in ("1", "true"):
+            tls["insecure"] = True
+        ob["tls"] = tls
+
+    ws_host = host_override or q.get("host")
+    if net == "ws":
+        tr = {"type": "ws", "path": path}
+        if ws_host:
+            tr["headers"] = {"Host": ws_host}
+        # ?ed=N — ранние данные (V2Ray early data), sing-box задаёт их отдельно
+        _ed = re.search(r'[?&]ed=(\d+)', path)
+        if _ed:
+            tr["path"] = path.split("?")[0]
+            tr["max_early_data"] = int(_ed.group(1))
+            tr["early_data_header_name"] = "Sec-WebSocket-Protocol"
+        ob["transport"] = tr
+    elif net == "grpc":
+        ob["transport"] = {"type": "grpc", "service_name": q.get("serviceName", "")}
+    elif net == "httpupgrade":
+        tr = {"type": "httpupgrade", "path": path}
+        if ws_host:
+            tr["host"] = ws_host
+        ob["transport"] = tr
+
+    summary = f"  сервер   : {host}:{port}\n  security : {sec}, transport: {net}"
+
+elif url.startswith("ss://"):
+    raw = url[len("ss://"):]
+    frag = ""
+    if "#" in raw:
+        raw, frag = raw.split("#", 1)
+    query = ""
+    if "?" in raw:
+        raw, query = raw.split("?", 1)
+    q = dict(up.parse_qsl(query))
+
+    if "@" in raw:
+        # SIP002: ss://BASE64(method:password)@host:port  (userinfo может
+        # быть percent-encoded base64, реже — уже "method:password" открытым
+        # текстом).
+        userinfo, hostport = raw.rsplit("@", 1)
+        userinfo = up.unquote(userinfo)
+        if ":" in userinfo:
+            method, password = userinfo.split(":", 1)
+        else:
+            method, password = b64decode(userinfo).decode().split(":", 1)
+    else:
+        # Legacy: ss://BASE64(method:password@host:port)
+        decoded = b64decode(raw).decode()
+        methodpass, hostport = decoded.rsplit("@", 1)
+        method, password = methodpass.split(":", 1)
+
+    host, _, port_s = hostport.rpartition(":")
+    if not host or not port_s:
+        sys.exit(f"Не удалось разобрать host:port из {hostport!r}")
+    port = int(port_s)
+
+    if q.get("plugin"):
+        sys.exit(f"Ключ использует plugin={q['plugin']!r} (obfs/v2ray-plugin) — "
+                 "sing-box такое напрямую не поддерживает без внешнего бинаря плагина.\n"
+                 "Попробуй ключ без plugin, либо это придётся ставить отдельно.")
+
+    ob = {"type": "shadowsocks", "tag": "proxy-out",
+          "server": host, "server_port": port,
+          "method": method, "password": password}
+
+    summary = f"  сервер   : {host}:{port}\n  метод    : {method}"
+
+else:
+    sys.exit("Неизвестная схема ключа")
 
 cfg = {
     "log": {"level": "warn", "timestamp": True},
@@ -145,13 +213,12 @@ cfg = {
         "listen_port": 1080
     }],
     "outbounds": [ob],
-    "route": {"final": "vless-out", "auto_detect_interface": True}
+    "route": {"final": "proxy-out", "auto_detect_interface": True}
 }
 with open(out_path, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 
-print(f"  сервер   : {host}:{port}")
-print(f"  security : {sec}, transport: {net}")
+print(summary)
 PYEOF
 
 sing-box check -c "${CONF_DIR}/config.json" || { err "sing-box забраковал конфиг"; exit 1; }
@@ -202,12 +269,12 @@ if ! systemctl is-active --quiet sing-box; then
 fi
 
 echo
-echo "${BLD}Готово.${RST} YouTube-трафик уходит через VLESS."
+echo "${BLD}Готово.${RST} YouTube-трафик уходит через прокси."
 echo
 echo "Проверки:"
 echo "  systemctl status sing-box --no-pager"
 echo "  ip route show table ${RT_TABLE}          # default dev ${TUN_IF}"
-echo "  curl -s --socks5 127.0.0.1:1080 ipinfo.io  # страна выхода VLESS"
+echo "  curl -s --socks5 127.0.0.1:1080 ipinfo.io  # страна выхода"
 echo
 echo "Откат на албанский туннель:"
 echo "  systemctl disable --now sing-box && systemctl enable --now wg-quick@wgnoads"
