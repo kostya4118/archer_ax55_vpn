@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
 # vless-youtube-exit.sh — пустить YouTube-трафик через готовый ключ (VLESS или
-# Shadowsocks/Outline) вместо отдельного VPS (замена wgnoads).
+# Shadowsocks/Outline), без AdGuard и без ipset.
 #
 # Идея: и VLESS, и Shadowsocks — прокси-протоколы, их нельзя напрямую
 # подставить в таблицу маршрутизации. Поэтому поднимаем sing-box с
-# TUN-инбаундом: он создаёт интерфейс singbox0, всё попавшее туда уходит в
-# прокси. Существующая схема
-#   AdGuard(dns.ipset) -> ipset youtube -> iptables MARK -> ip rule fwmark
-# остаётся без изменений, меняется только устройство в таблице 200.
+# TUN-инбаундом (singbox0). В tun заворачивается весь HTTPS/QUIC-трафик
+# VPN-клиентов (порт 443, tcp+udp) через iptables mark + policy routing.
+# Дальше решение "это ютуб или нет" принимает САМ sing-box: он смотрит SNI
+# в TLS ClientHello / QUIC (без всякого DNS) и по domain_suffix отправляет
+# совпавшее в прокси (VLESS/SS), а всё остальное — обычным путём напрямую
+# (outbound "direct-out", идёт как будто прокси вообще нет).
 #
-# Требуется: уже отработавший local-route-setup.sh (ipset + маркировка).
+# Раньше это делалось через AdGuard (dns.ipset -> ipset -> iptables MARK по
+# IP) — но так пропадает надобность в AdGuard целиком: он был не нужен для
+# самой схемы, только для наполнения списка IP.
 #
 # Запуск:
 #   sudo bash vless-youtube-exit.sh 'vless://UUID@host:443?security=reality&...'
@@ -51,20 +55,14 @@ case "${PROXY_URL}" in
   *) err "Ключ должен начинаться с vless:// или ss://"; exit 1 ;;
 esac
 
-# --- 1. Проверяем, что базовая схема уже настроена ---------------------------
-if ! ipset list youtube >/dev/null 2>&1; then
-  err "Нет ipset 'youtube' — сначала запусти noads-exit/local-route-setup.sh"
-  exit 1
-fi
-
-# --- 2. Ставим sing-box ------------------------------------------------------
+# --- 1. Ставим sing-box ------------------------------------------------------
 if ! command -v sing-box >/dev/null 2>&1; then
   info "Устанавливаю sing-box..."
   curl -fsSL https://sing-box.app/install.sh | sh
 fi
 command -v sing-box >/dev/null 2>&1 || { err "sing-box не установился"; exit 1; }
 
-# --- 3. Генерируем конфиг из ключа -------------------------------------------
+# --- 2. Генерируем конфиг из ключа -------------------------------------------
 info "Разбираю ключ и генерирую конфиг..."
 mkdir -p "${CONF_DIR}"
 python3 - "${PROXY_URL}" "${CONF_DIR}/config.json" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" "${VLESS_HOST}" <<'PYEOF'
@@ -191,8 +189,20 @@ elif url.startswith("ss://"):
 else:
     sys.exit("Неизвестная схема ключа")
 
+YOUTUBE_DOMAINS = [
+    "youtube.com", "youtu.be", "googlevideo.com", "ytimg.com",
+    "ggpht.com", "youtubei.googleapis.com", "youtube.googleapis.com",
+    "youtube-nocookie.com",
+]
+
 cfg = {
     "log": {"level": "warn", "timestamp": True},
+    "dns": {
+        # Свой DNS для sing-box (не зависит от AdGuard/системного резолвера).
+        "servers": [{"tag": "dns-direct", "address": "1.1.1.1", "detour": "direct-out"}],
+        "final": "dns-direct",
+        "independent_cache": True
+    },
     "inbounds": [{
         "type": "tun",
         "tag": "tun-in",
@@ -203,7 +213,11 @@ cfg = {
         # иначе sing-box перехватил бы весь трафик сервера.
         "auto_route": False,
         "strict_route": False,
-        "stack": "system"
+        "stack": "system",
+        # sniff — смотрит SNI в TLS ClientHello / QUIC без всякого DNS, чтобы
+        # route.rules ниже могли матчить по домену.
+        "sniff": True,
+        "sniff_override_destination": False
     }, {
         # Только для проверки страны выхода: curl --socks5 127.0.0.1:1080 ipinfo.io
         # Слушает localhost, снаружи недоступен.
@@ -212,17 +226,38 @@ cfg = {
         "listen": "127.0.0.1",
         "listen_port": 1080
     }],
-    "outbounds": [ob],
-    "route": {"final": "proxy-out", "auto_detect_interface": True}
+    "outbounds": [ob, {"type": "direct", "tag": "direct-out"}],
+    "route": {
+        "rules": [
+            {"domain_suffix": YOUTUBE_DOMAINS, "outbound": "proxy-out"}
+        ],
+        # Всё, что не совпало с youtube-доменами, уходит напрямую — как будто
+        # прокси вообще нет. Если прокси недоступен, ломается только ютуб,
+        # а не весь интернет клиентов.
+        "final": "direct-out",
+        "auto_detect_interface": True
+    }
 }
 with open(out_path, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 print(summary)
+print(f"  домены   : {', '.join(YOUTUBE_DOMAINS)}")
 PYEOF
 
 sing-box check -c "${CONF_DIR}/config.json" || { err "sing-box забраковал конфиг"; exit 1; }
 info "Конфиг валиден."
+
+# --- 3. Заворачиваем HTTPS/QUIC (443) от VPN-клиентов в tun sing-box ---------
+# Раньше матчили по ipset (наполнял AdGuard); теперь AdGuard не нужен —
+# в tun идёт весь трафик 443 от amn0, а домен смотрит сам sing-box через
+# sniffing (см. выше). Остальные порты (в т.ч. DNS) tun не касаются.
+info "Настраиваю маркировку HTTPS/QUIC-трафика от VPN-клиентов (amn0)..."
+BRIDGE_IF="${BRIDGE_IF:-amn0}"
+for proto in tcp udp; do
+  iptables -t mangle -C PREROUTING -i "${BRIDGE_IF}" -p "${proto}" --dport 443 -j MARK --set-mark "${FWMARK}" 2>/dev/null || \
+    iptables -t mangle -A PREROUTING -i "${BRIDGE_IF}" -p "${proto}" --dport 443 -j MARK --set-mark "${FWMARK}"
+done
 
 # --- 4. Хелпер: поднять маршрут после старта sing-box ------------------------
 cat > "${ROUTE_UP}" <<EOF
@@ -268,13 +303,17 @@ if ! systemctl is-active --quiet sing-box; then
   exit 1
 fi
 
+command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null || true
+
 echo
-echo "${BLD}Готово.${RST} YouTube-трафик уходит через прокси."
+echo "${BLD}Готово.${RST} Домены ютуба уходят через прокси, остальной HTTPS — напрямую."
+echo "AdGuard для этого не нужен — sing-box сам смотрит SNI и решает маршрут."
 echo
 echo "Проверки:"
 echo "  systemctl status sing-box --no-pager"
 echo "  ip route show table ${RT_TABLE}          # default dev ${TUN_IF}"
 echo "  curl -s --socks5 127.0.0.1:1080 ipinfo.io  # страна выхода"
+echo "  journalctl -u sing-box -n 20 --no-pager    # ошибки подключения к прокси"
 echo
-echo "Откат на албанский туннель:"
-echo "  systemctl disable --now sing-box && systemctl enable --now wg-quick@wgnoads"
+echo "Откат (выключить youtube-роутинг совсем):"
+echo "  systemctl disable --now sing-box"
