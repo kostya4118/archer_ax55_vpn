@@ -212,11 +212,7 @@ cfg = {
         # иначе sing-box перехватил бы весь трафик сервера.
         "auto_route": False,
         "strict_route": False,
-        "stack": "system",
-        # sniff — смотрит SNI в TLS ClientHello / QUIC без всякого DNS, чтобы
-        # route.rules ниже могли матчить по домену.
-        "sniff": True,
-        "sniff_override_destination": False
+        "stack": "system"
     }, {
         # Только для проверки страны выхода: curl --socks5 127.0.0.1:1080 ipinfo.io
         # Слушает localhost, снаружи недоступен.
@@ -228,6 +224,10 @@ cfg = {
     "outbounds": [ob, {"type": "direct", "tag": "direct-out"}],
     "route": {
         "rules": [
+            # sniff (было полем инбаунда до sing-box 1.11, теперь — action
+            # правила) смотрит SNI в TLS ClientHello / QUIC без всякого DNS,
+            # чтобы следующее правило могло матчить по домену.
+            {"action": "sniff"},
             {"domain_suffix": YOUTUBE_DOMAINS, "outbound": "proxy-out"}
         ],
         # Всё, что не совпало с youtube-доменами, уходит напрямую — как будто
