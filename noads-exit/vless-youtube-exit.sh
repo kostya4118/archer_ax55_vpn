@@ -58,7 +58,7 @@ command -v sing-box >/dev/null 2>&1 || { err "sing-box не установилс
 info "Разбираю VLESS-ключ и генерирую конфиг..."
 mkdir -p "${CONF_DIR}"
 python3 - "${VLESS_URL}" "${CONF_DIR}/config.json" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" <<'PYEOF'
-import json, sys, urllib.parse as up
+import json, re, sys, urllib.parse as up
 
 url, out_path, tun_if, tun_addr, tun_mtu = sys.argv[1:6]
 u = up.urlparse(url)
@@ -68,8 +68,16 @@ if not uuid or not host:
     sys.exit("Не удалось разобрать ключ: нет UUID или адреса сервера")
 q = dict(up.parse_qsl(u.query))
 
+# path вытаскиваем регуляркой, а не через parse_qsl: в ключах он часто записан
+# незакодированным (path=/?ed=2560), и разбор query-строки обрубил бы его на "/".
+_m = re.search(r'(?:^|&)path=([^&]*)', u.query)
+path = up.unquote(_m.group(1)) if _m else "/"
+
 sec = q.get("security", "none")
 net = q.get("type", "tcp")
+if net in ("xhttp", "splithttp"):
+    sys.exit("Транспорт xhttp/splithttp умеет только xray-core, sing-box — нет.\n"
+             "Нужен другой ключ или связка на базе xray.")
 
 ob = {"type": "vless", "tag": "vless-out",
       "server": host, "server_port": int(port), "uuid": uuid}
@@ -93,14 +101,20 @@ if sec in ("tls", "reality", "xtls"):
     ob["tls"] = tls
 
 if net == "ws":
-    tr = {"type": "ws", "path": q.get("path", "/")}
+    tr = {"type": "ws", "path": path}
     if q.get("host"):
         tr["headers"] = {"Host": q["host"]}
+    # ?ed=N — ранние данные (V2Ray early data), sing-box задаёт их отдельно
+    _ed = re.search(r'[?&]ed=(\d+)', path)
+    if _ed:
+        tr["path"] = path.split("?")[0]
+        tr["max_early_data"] = int(_ed.group(1))
+        tr["early_data_header_name"] = "Sec-WebSocket-Protocol"
     ob["transport"] = tr
 elif net == "grpc":
     ob["transport"] = {"type": "grpc", "service_name": q.get("serviceName", "")}
 elif net == "httpupgrade":
-    tr = {"type": "httpupgrade", "path": q.get("path", "/")}
+    tr = {"type": "httpupgrade", "path": path}
     if q.get("host"):
         tr["host"] = q["host"]
     ob["transport"] = tr
