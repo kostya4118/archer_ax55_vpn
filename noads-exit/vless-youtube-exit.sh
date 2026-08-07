@@ -197,12 +197,11 @@ YOUTUBE_DOMAINS = [
 
 cfg = {
     "log": {"level": "warn", "timestamp": True},
-    "dns": {
-        # Свой DNS для sing-box (не зависит от AdGuard/системного резолвера).
-        "servers": [{"tag": "dns-direct", "address": "1.1.1.1", "detour": "direct-out"}],
-        "final": "dns-direct",
-        "independent_cache": True
-    },
+    # Блок "dns" намеренно не добавляем: outbound задан голым IP (не доменом),
+    # а домен для route.rules sing-box берёт из sniffing SNI/QUIC прямо в
+    # TLS-пакете — резолвить самому ему нечего. Старый формат DNS-блока
+    # ("address": ...) с sing-box 1.12+ вообще не принимается без
+    # ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true, а новый тут не нужен.
     "inbounds": [{
         "type": "tun",
         "tag": "tun-in",
