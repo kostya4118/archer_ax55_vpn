@@ -225,6 +225,44 @@ docker exec amnezia-awg nslookup doubleclick.net 1.1.1.1     # реклама ->
    ```
    Затем откройте популярный ролик на клиенте **без входа в Google-аккаунт**.
 
+### Вариант без второго VPS: выход через готовый VLESS-ключ
+
+Если уже есть VLESS-ключ, на котором YouTube идёт без рекламы, отдельный VPS не
+нужен — YouTube-трафик можно направить в него.
+
+VLESS — прокси-протокол, а не сетевой интерфейс, поэтому напрямую в маршрут его
+не подставить. Решение: **sing-box с TUN-инбаундом** поднимает интерфейс
+`singbox0`, всё попавшее туда уходит в VLESS. Вся остальная схема (AdGuard →
+ipset → fwmark → policy routing) не меняется — только таблица 200 указывает на
+`singbox0` вместо `wgnoads`.
+
+```bash
+sudo bash noads-exit/vless-youtube-exit.sh 'vless://UUID@host:443?security=reality&pbk=...&sni=...'
+```
+
+Скрипт: поставит sing-box, разберёт ключ (reality/tls, tcp/ws/grpc/httpupgrade),
+сгенерирует конфиг, проверит его, повесит policy routing на tun через
+systemd-хук и остановит `wgnoads` (конфиг останется — откат в одну команду).
+
+Важно: `auto_route` выставлен в `false`, иначе sing-box перехватил бы весь
+трафик сервера, а не только помеченный YouTube-трафик.
+
+Проверки:
+```bash
+systemctl status sing-box --no-pager
+ip route show table 200                  # default dev singbox0
+curl -s --interface singbox0 ipinfo.io   # страна выхода VLESS
+```
+
+Откат на свой VPS:
+```bash
+systemctl disable --now sing-box && systemctl enable --now wg-quick@wgnoads
+```
+
+Оговорка: провайдер VLESS-ключа видит весь YouTube-трафик (остальной трафик
+по-прежнему идёт через свой сервер), а чужой ключ может в любой момент
+перестать работать.
+
 ### Честные оговорки
 - Для залогиненных аккаунтов таргетинг обычно тоже идёт по IP, но страна
   аккаунта может частично влиять — проверяйте на своём.
