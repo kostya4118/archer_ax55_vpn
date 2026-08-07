@@ -18,6 +18,9 @@
 #
 set -euo pipefail
 
+# Заголовок Host для ws/httpupgrade. Нужен, когда сервер за CDN/реверс-прокси
+# и в ключе нет параметра host= (симптом: "unexpected HTTP response status: 404").
+VLESS_HOST="${VLESS_HOST:-}"
 TUN_IF="${TUN_IF:-singbox0}"
 TUN_ADDR="${TUN_ADDR:-172.19.0.1/30}"
 TUN_MTU="${TUN_MTU:-1400}"
@@ -57,10 +60,10 @@ command -v sing-box >/dev/null 2>&1 || { err "sing-box не установилс
 # --- 3. Генерируем конфиг из vless:// ---------------------------------------
 info "Разбираю VLESS-ключ и генерирую конфиг..."
 mkdir -p "${CONF_DIR}"
-python3 - "${VLESS_URL}" "${CONF_DIR}/config.json" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" <<'PYEOF'
+python3 - "${VLESS_URL}" "${CONF_DIR}/config.json" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" "${VLESS_HOST}" <<'PYEOF'
 import json, re, sys, urllib.parse as up
 
-url, out_path, tun_if, tun_addr, tun_mtu = sys.argv[1:6]
+url, out_path, tun_if, tun_addr, tun_mtu, host_override = sys.argv[1:7]
 u = up.urlparse(url)
 uuid = up.unquote(u.username or "")
 host, port = u.hostname, u.port or 443
@@ -100,10 +103,11 @@ if sec in ("tls", "reality", "xtls"):
         tls["insecure"] = True
     ob["tls"] = tls
 
+ws_host = host_override or q.get("host")
 if net == "ws":
     tr = {"type": "ws", "path": path}
-    if q.get("host"):
-        tr["headers"] = {"Host": q["host"]}
+    if ws_host:
+        tr["headers"] = {"Host": ws_host}
     # ?ed=N — ранние данные (V2Ray early data), sing-box задаёт их отдельно
     _ed = re.search(r'[?&]ed=(\d+)', path)
     if _ed:
@@ -115,8 +119,8 @@ elif net == "grpc":
     ob["transport"] = {"type": "grpc", "service_name": q.get("serviceName", "")}
 elif net == "httpupgrade":
     tr = {"type": "httpupgrade", "path": path}
-    if q.get("host"):
-        tr["host"] = q["host"]
+    if ws_host:
+        tr["host"] = ws_host
     ob["transport"] = tr
 
 cfg = {
