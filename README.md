@@ -251,7 +251,7 @@ systemd-хук и остановит `wgnoads` (конфиг останется 
 ```bash
 systemctl status sing-box --no-pager
 ip route show table 200                  # default dev singbox0
-curl -s --interface singbox0 ipinfo.io   # страна выхода VLESS
+curl -s --socks5 127.0.0.1:1080 ipinfo.io  # страна выхода VLESS
 ```
 
 Откат на свой VPS:

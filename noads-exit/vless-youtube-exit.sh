@@ -118,6 +118,13 @@ cfg = {
         "auto_route": False,
         "strict_route": False,
         "stack": "system"
+    }, {
+        # Только для проверки страны выхода: curl --socks5 127.0.0.1:1080 ipinfo.io
+        # Слушает localhost, снаружи недоступен.
+        "type": "socks",
+        "tag": "socks-test",
+        "listen": "127.0.0.1",
+        "listen_port": 1080
     }],
     "outbounds": [ob],
     "route": {"final": "vless-out", "auto_detect_interface": True}
@@ -182,7 +189,7 @@ echo
 echo "Проверки:"
 echo "  systemctl status sing-box --no-pager"
 echo "  ip route show table ${RT_TABLE}          # default dev ${TUN_IF}"
-echo "  curl -s --interface ${TUN_IF} ipinfo.io  # страна выхода VLESS"
+echo "  curl -s --socks5 127.0.0.1:1080 ipinfo.io  # страна выхода VLESS"
 echo
 echo "Откат на албанский туннель:"
 echo "  systemctl disable --now sing-box && systemctl enable --now wg-quick@wgnoads"
