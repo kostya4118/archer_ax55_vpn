@@ -65,7 +65,8 @@ command -v sing-box >/dev/null 2>&1 || { err "sing-box не установилс
 # --- 2. Генерируем конфиг из ключа -------------------------------------------
 info "Разбираю ключ и генерирую конфиг..."
 mkdir -p "${CONF_DIR}"
-python3 - "${PROXY_URL}" "${CONF_DIR}/config.json" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" "${VLESS_HOST}" <<'PYEOF'
+NEW_CONF="${CONF_DIR}/config.json.new"
+python3 - "${PROXY_URL}" "${NEW_CONF}" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" "${VLESS_HOST}" <<'PYEOF'
 import base64, json, re, sys, urllib.parse as up
 
 url, out_path, tun_if, tun_addr, tun_mtu, host_override = sys.argv[1:7]
@@ -252,8 +253,16 @@ print(summary)
 print(f"  домены   : {', '.join(YOUTUBE_DOMAINS)}")
 PYEOF
 
-sing-box check -c "${CONF_DIR}/config.json" || { err "sing-box забраковал конфиг"; exit 1; }
+if ! sing-box check -c "${NEW_CONF}"; then
+  err "sing-box забраковал конфиг — старый конфиг на диске не тронут, служба продолжает работать как раньше."
+  rm -f "${NEW_CONF}"
+  exit 1
+fi
 info "Конфиг валиден."
+# Только теперь, когда проверка прошла, заменяем боевой конфиг — атомарно
+# (mv на той же ФС), чтобы битый конфиг никогда не мог лечь на диск и
+# сломать следующий запуск/перезапуск sing-box.
+mv -f "${NEW_CONF}" "${CONF_DIR}/config.json"
 
 # --- 3. Заворачиваем HTTPS/QUIC (443) от VPN-клиентов в tun sing-box ---------
 # Раньше матчили по ipset (наполнял AdGuard); теперь AdGuard не нужен —
