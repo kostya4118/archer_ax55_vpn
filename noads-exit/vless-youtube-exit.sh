@@ -106,7 +106,15 @@ if url.startswith("vless://"):
     if q.get("flow"):
         ob["flow"] = q["flow"]
     if q.get("encryption") and q["encryption"] != "none":
-        ob["encryption"] = q["encryption"]
+        # Постквантовая "VLESS encryption" (mlkem768x25519plus...) — фича
+        # свежего xray-core без TLS/Reality вообще. У sing-box в схеме
+        # VLESS-outbound такого поля нет в принципе (проверено: "unknown
+        # field \"encryption\"" при sing-box check, а не просто "не умеет
+        # алгоритм"). Ключи с этим — мимо, нужен xray-core или другой ключ.
+        sys.exit("Ключ использует постквантовую VLESS-шифровку "
+                 f"({q['encryption'][:40]}...) без TLS — её поддерживает только "
+                 "xray-core, у sing-box такого поля нет вообще.\n"
+                 "Нужен ключ на TLS/Reality либо связка на базе xray-core.")
 
     if sec in ("tls", "reality", "xtls"):
         tls = {"enabled": True, "server_name": q.get("sni") or q.get("host") or host}
