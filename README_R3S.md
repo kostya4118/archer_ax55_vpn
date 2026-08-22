@@ -1,283 +1,426 @@
-# VLESS VPN + WireGuard сервер на NanoPi R3S
+# NanoPi R3S LTS + OpenWrt 25.12 + AmneziaWG + Podkop
 
-Гайд по настройке NanoPi R3S как VPN-шлюза с:
-- **Podkop + VLESS** — выборочная маршрутизация заблокированных сайтов через VPN
-- **WireGuard-сервер** — подключение с телефона снаружи через домашнюю сеть
+Рабочая инструкция по превращению NanoPi R3S LTS в VPN-шлюз с выборочной
+маршрутизацией: заблокированные ресурсы уходят в туннель AmneziaWG,
+российские сайты и всё остальное идут напрямую.
 
-Archer AX55 при этом остаётся в штатном режиме.
+Archer AX55 остаётся в схеме как точка доступа Wi-Fi и не перепрошивается.
 
 ## Схема сети
 
 ```
-Телефон (мобильный интернет)
-    ↓ WireGuard
-Интернет → Провайдер → NanoPi R3S (WAN) → (LAN) Archer AX55 → Устройства
-                              ↓ VLESS (Podkop)
-                        Зарубежный сервер
-                              ↓
-                    Instagram, YouTube, etc.
+Провайдер ──▶ WAN (eth0) │ NanoPi R3S │ LAN (eth1) ──▶ Archer AX55 (режим точки доступа) ──▶ устройства
+                         │            │
+                         │   awg0 ────┼──▶ сервер Amnezia ──▶ заблокированные ресурсы
+                         │            │
+                         │  Podkop / sing-box решает, что куда
 ```
+
+Маршрутизацией управляет Podkop: он подменяет DNS-ответы для доменов из
+списков на адреса `198.18.0.0/15` (FakeIP) и заворачивает трафик к ним в
+туннель. Всё, чего нет в списках, идёт мимо VPN.
 
 ## Что понадобится
 
-- NanoPi R3S (RK3566, 2 ГБ RAM, 32 ГБ eMMC)
-- MicroSD карта 4+ ГБ (только для первоначальной прошивки)
-- Два патч-корда (провайдер → NanoPi, NanoPi → роутер)
-- VLESS-ссылка вида `vless://...`
-- Белый IP от провайдера (для WireGuard-сервера)
+- NanoPi R3S или R3S LTS
+- MicroSD 8+ ГБ
+- Два патч-корда
+- Сервер Amnezia с настроенным протоколом AmneziaWG
+- Mac или Linux для записи образа
 
 ---
 
-## Часть 1: Установка OpenWrt 24.10
+## Часть 1. Прошивка
 
-### Шаг 1: Скачать образы
+### Важно про R3S LTS
 
-Нужно два образа:
+R3S LTS — отдельная ревизия платы (добавлены HDMI, MIPI-DSI, разъём
+динамика, кнопка питания), вышедшая в июле 2025. Отдельного профиля в
+OpenWrt для неё **нет**: в `target/linux/rockchip/image/armv8.mk` определён
+только `friendlyarm_nanopi-r3s`.
 
-**1. Образ для загрузки с SD-карты** (initramfs — временный, для первого запуска):
-```
-https://firmware-selector.openwrt.org/?version=24.10.0&target=rockchip%2Farmv8&id=friendlyarm_nanopi-r3s
-```
-Скачай: `openwrt-24.10.0-rockchip-armv8-friendlyarm_nanopi-r3s-initramfs-kernel.itb`
+Тем не менее образ обычного R3S на LTS загружается и работает — SoC тот же
+RK3566, device tree подходит. Оба порта Ethernet поднимаются, плата
+определяется как `friendlyarm,nanopi-r3s`. Проверено на 24.10.0 и 25.12.5.
 
-**2. Образ для прошивки на eMMC** (sysupgrade — постоянный):
-```
-openwrt-24.10.0-rockchip-armv8-friendlyarm_nanopi-r3s-squashfs-sysupgrade.img.gz
-```
+Если бы не завелось, запасной путь — FriendlyWrt от производителя:
+[Actions-FriendlyWrt/releases](https://github.com/friendlyarm/Actions-FriendlyWrt/releases),
+файл `R3S-Series-FriendlyWrt-24.10.img.gz` (образы там названы по сериям, а
+не по отдельным платам, поэтому поиск по `r3s-lts` ничего не даёт).
 
-### Шаг 2: Записать initramfs на MicroSD
+### Скачать и записать образ
 
-**На Windows:** используй [balenaEtcher](https://etcher.balena.io/)
+Готового initramfs-образа для R3S не публикуют — на карту пишется сразу
+sysupgrade-образ, с него плата и работает.
 
-**На Linux/Mac:**
 ```bash
-gunzip openwrt-*-initramfs-kernel.itb.gz 2>/dev/null || true
-dd if=openwrt-*-initramfs-kernel.itb of=/dev/sdX bs=4M status=progress
-sync
-```
-> Замени `/dev/sdX` на свою карту — проверь через `lsblk`!
-
-### Шаг 3: Первый запуск с SD-карты
-
-1. Вставь MicroSD в R3S
-2. Подключи **LAN-порт R3S** к компьютеру патч-кордом
-3. Включи питание (USB-C, 5V/2A)
-4. Подожди 1–2 минуты
-
-OpenWrt загрузится с SD-карты в RAM. Подключись по SSH:
-```bash
-ssh root@192.168.1.1
-# Пароль пустой — нажми Enter
+cd ~/Downloads
+curl -LO https://downloads.openwrt.org/releases/25.12.5/targets/rockchip/armv8/openwrt-25.12.5-rockchip-armv8-friendlyarm_nanopi-r3s-squashfs-sysupgrade.img.gz
 ```
 
-### Шаг 4: Прошить OpenWrt на eMMC
+Найти карту и записать (macOS):
 
-Передай sysupgrade-образ на R3S:
 ```bash
-scp openwrt-*-squashfs-sysupgrade.img.gz root@192.168.1.1:/tmp/
+diskutil list                       # найти свою карту по размеру, например /dev/disk6
+diskutil unmountDisk /dev/disk6
+sudo sh -c "gunzip -c ~/Downloads/openwrt-25.12.5-*-sysupgrade.img.gz | dd of=/dev/disk6 bs=4M"
+diskutil eject /dev/disk6
 ```
 
-На R3S прошей eMMC:
+macOS после записи покажет «Подключённый диск нельзя прочитать» — это
+нормально, он не понимает файловую систему OpenWrt. Нажать «Пропустить».
+
+### Первый запуск
+
+Вставить карту, соединить **LAN-порт R3S** с компьютером патч-кордом,
+подать питание, подождать пару минут.
+
 ```bash
-ssh root@192.168.1.1
+ssh root@192.168.1.1     # пароль пустой
+```
 
-# Распакуй образ
-gunzip /tmp/openwrt-*-squashfs-sysupgrade.img.gz
+Сразу задать пароль: `passwd`.
 
-# Прошей на eMMC
-dd if=/tmp/openwrt-*-squashfs-sysupgrade.img of=/dev/mmcblk0 bs=4M conv=fsync status=progress
-sync
+### Ключ SSH
 
+В OpenWrt SSH-сервер — dropbear, ключи лежат не в `~/.ssh`:
+
+```bash
+cat ~/.ssh/id_ed25519.pub | ssh root@192.168.1.1 \
+  "cat >> /etc/dropbear/authorized_keys && chmod 600 /etc/dropbear/authorized_keys"
+```
+
+### Проверка железа
+
+```bash
+ip link show                    # должны быть eth0 (WAN) и eth1 (LAN, в br-lan)
+ubus call system board
+```
+
+---
+
+## Часть 2. Подключение к провайдеру
+
+### Клонирование MAC
+
+Если провайдер привязывает выдачу адреса к MAC, проще подставить R3S адрес
+старого роутера, чем просить перепривязку. WAN MAC у Archer AX55:
+**Расширенная → Сеть → Состояние → WAN MAC-адрес**.
+
+Начиная с OpenWrt 21.02 MAC задаётся **в секции устройства**, а не
+интерфейса — `network.wan.macaddr` молча игнорируется:
+
+```bash
+SEC=$(uci show network | awk -F. "/\.name='eth0'/{print \$2; exit}")
+uci set network.$SEC.macaddr='AA:BB:CC:DD:EE:FF'
+uci commit network
 reboot
 ```
 
-После перезагрузки **вытащи MicroSD** — R3S загрузится с eMMC.
+Проверка: `ip link show eth0 | grep ether`.
 
-### Шаг 5: Первичная настройка
-
-Зайди в LuCI: `http://192.168.1.1`
-
-Логин: `root`, пароль: пустой (задай сразу).
-
----
-
-## Часть 2: Подключение к провайдеру
-
-### Физическое подключение
-
-```
-Кабель провайдера → WAN-порт R3S
-LAN-порт R3S → WAN-порт Archer AX55
-```
-
-### Настройка WAN в OpenWrt
-
-LuCI: **Network → Interfaces → WAN → Edit**
-
-- DHCP: протокол `DHCP client`
-- PPPoE: протокол `PPPoE`, логин и пароль от провайдера
-
-### Настройка Archer AX55
-
-В веб-интерфейсе AX55:
-- Настройки WAN → тип подключения: **Dynamic IP (DHCP)**
-
----
-
-## Часть 3: Установка Podkop (VLESS + выборочная маршрутизация)
+При динамическом IP настраивать больше нечего — DHCP на WAN включён по
+умолчанию. Для PPPoE:
 
 ```bash
-ssh root@192.168.1.1
+uci set network.wan.proto='pppoe'
+uci set network.wan.username='ЛОГИН'
+uci set network.wan.password='ПАРОЛЬ'
+uci commit network && /etc/init.d/network restart
+```
+
+Проверка:
+
+```bash
+ifstatus wan | grep -E '"up"|"address"'
+ping -c 3 8.8.8.8
+```
+
+### Archer AX55 в режим точки доступа
+
+**Расширенная → Система → Режим работы → Точка доступа.**
+
+Это обязательный шаг, если LAN-подсети совпадают. Без него получается
+двойной NAT, и Podkop видит весь трафик как исходящий от одного адреса
+AX55 — правила по конкретным устройствам становятся невозможны.
+
+После переключения AX55 получает адрес от R3S по DHCP. Чтобы закрепить его:
+
+```bash
+uci add dhcp host
+uci set dhcp.@host[-1].name='ax55'
+uci set dhcp.@host[-1].mac='AA:BB:CC:DD:EE:FE'   # LAN MAC роутера
+uci set dhcp.@host[-1].ip='192.168.1.2'
+uci commit dhcp && /etc/init.d/dnsmasq restart
+```
+
+Адрес берётся вне DHCP-пула (пул начинается со `192.168.1.100`).
+
+Кабели: провайдер → WAN R3S, LAN R3S → любой порт AX55.
+
+---
+
+## Часть 3. AmneziaWG
+
+### Пакеты
+
+`kmod-amneziawg` — модуль ядра, жёстко привязанный к конкретной сборке.
+Версия пакета обязана совпадать с версией OpenWrt. Сборки берутся из
+[Slava-Shchipunov/awg-openwrt](https://github.com/Slava-Shchipunov/awg-openwrt/releases).
+
+В OpenWrt 25.12 пакетный менеджер — `apk`, файлы с расширением `.apk`
+(в 24.10 был `opkg` и `.ipk`).
+
+```bash
+cd /tmp
+BASE=https://github.com/Slava-Shchipunov/awg-openwrt/releases/download/v25.12.5
+
+wget -O kmod-amneziawg.apk   $BASE/kmod-amneziawg_v25.12.5_aarch64_generic_rockchip_armv8.apk
+wget -O amneziawg-tools.apk  $BASE/amneziawg-tools_v25.12.5_aarch64_generic_rockchip_armv8.apk
+
+apk add --allow-untrusted ./kmod-amneziawg.apk ./amneziawg-tools.apk
+```
+
+Флаг `-O` обязателен: GitHub перебрасывает на подписанный URL хранилища, и
+BusyBox `wget` иначе сохранит файл под именем из пути редиректа.
+
+`--allow-untrusted` нужен потому, что пакеты собраны сторонним репозиторием.
+
+Проверка:
+
+```bash
+modprobe amneziawg && lsmod | grep amneziawg
+awg --version
+```
+
+### Про luci-proto-amneziawg
+
+В штатных репозиториях 25.12 пакета нет (`apk search amneziawg` пуст), в
+релизах awg-openwrt для этой версии тоже — только языковой пакет. Он нужен
+лишь для того, чтобы протокол появился в выпадающем списке LuCI; через UCI
+интерфейс настраивается полностью.
+
+### Конфиг из Amnezia
+
+В приложении: сервер → протокол AmneziaWG → поделиться подключением →
+формат **AmneziaWG** (нативный `.conf`, не «Amnezia»).
+
+Соответствие полей — точные имена опций можно посмотреть прямо в
+protocol-скрипте: `grep -A40 'proto_amneziawg_init_config'
+/lib/netifd/proto/amneziawg.sh`.
+
+| `.conf` | UCI |
+|---|---|
+| `PrivateKey` | `private_key` |
+| `Address` | `addresses` |
+| `Jc` / `Jmin` / `Jmax` | `awg_jc` / `awg_jmin` / `awg_jmax` |
+| `S1`–`S4` | `awg_s1`–`awg_s4` |
+| `H1`–`H4` | `awg_h1`–`awg_h4` |
+| `I1`–`I5` | `awg_i1`–`awg_i5` |
+| `PublicKey` | `public_key` (в секции пира) |
+| `PresharedKey` | `preshared_key` |
+| `Endpoint` | `endpoint_host` + `endpoint_port` раздельно |
+
+В AmneziaWG 2.0 значения `H1`–`H4` могут быть диапазонами вида
+`1075176743-1725333805` — переносятся как есть.
+
+### Интерфейс
+
+```bash
+uci -q delete network.awg0
+uci set network.awg0=interface
+uci set network.awg0.proto='amneziawg'
+uci set network.awg0.private_key='ПРИВАТНЫЙ_КЛЮЧ'
+uci add_list network.awg0.addresses='10.8.1.4/32'
+uci set network.awg0.mtu='1420'
+
+uci set network.awg0.awg_jc='6'
+uci set network.awg0.awg_jmin='10'
+uci set network.awg0.awg_jmax='50'
+uci set network.awg0.awg_s1='16'
+uci set network.awg0.awg_s2='114'
+uci set network.awg0.awg_s3='45'
+uci set network.awg0.awg_s4='6'
+uci set network.awg0.awg_h1='1075176743-1725333805'
+uci set network.awg0.awg_h2='1993921499-2024794657'
+uci set network.awg0.awg_h3='2134227464-2145161654'
+uci set network.awg0.awg_h4='2146137760-2146702190'
+uci set network.awg0.awg_i1='<r 2><b 0x8580...>'
+```
+
+`I1` содержит пробелы и угловые скобки — только одинарные кавычки.
+
+Строка `DNS` из конфига намеренно не переносится: DNS настраивает Podkop.
+
+### Пир
+
+Имя секции обязано быть `amneziawg_<имя интерфейса>` — protocol-скрипт ищет
+её именно так (`config_foreach proto_amneziawg_setup_peer "amneziawg_${config}"`).
+
+```bash
+uci -q delete network.awgpeer
+uci set network.awgpeer=amneziawg_awg0
+uci set network.awgpeer.public_key='ПУБЛИЧНЫЙ_КЛЮЧ_СЕРВЕРА'
+uci set network.awgpeer.preshared_key='PRESHARED_KEY'
+uci add_list network.awgpeer.allowed_ips='0.0.0.0/0'
+uci add_list network.awgpeer.allowed_ips='::/0'
+uci set network.awgpeer.endpoint_host='1.2.3.4'
+uci set network.awgpeer.endpoint_port='41607'
+uci set network.awgpeer.persistent_keepalive='25'
+uci set network.awgpeer.route_allowed_ips='0'
+```
+
+**`route_allowed_ips='0'` — ключевая строка.** Она запрещает создавать
+маршрут по умолчанию через туннель. Без неё весь трафик уходит в VPN и
+выборочность теряется: маршрутизацией должен управлять Podkop.
+
+### Файрвол
+
+```bash
+uci add firewall zone
+uci set firewall.@zone[-1].name='awg'
+uci add_list firewall.@zone[-1].network='awg0'
+uci set firewall.@zone[-1].input='REJECT'
+uci set firewall.@zone[-1].output='ACCEPT'
+uci set firewall.@zone[-1].forward='REJECT'
+uci set firewall.@zone[-1].masq='1'
+uci set firewall.@zone[-1].mtu_fix='1'
+
+uci add firewall forwarding
+uci set firewall.@forwarding[-1].src='lan'
+uci set firewall.@forwarding[-1].dest='awg'
+
+uci commit network && uci commit firewall
+/etc/init.d/network restart && /etc/init.d/firewall restart
+```
+
+### Проверка туннеля
+
+```bash
+ip addr show awg0
+awg show
+ping -c 3 -I awg0 1.1.1.1
+```
+
+В выводе `awg show` должна появиться непустая строка `latest handshake` и
+трафик в обе стороны. Если байты только отправляются — сервер не отвечает,
+почти всегда причина в опечатке в параметрах обфускации или неверном
+`PresharedKey`.
+
+`curl` в базовой поставке 25.12 нет, ставится отдельно: `apk add curl`.
+Тогда доступна проверка выхода через туннель:
+
+```bash
+curl --interface awg0 -s https://ifconfig.me     # IP сервера Amnezia
+```
+
+---
+
+## Часть 4. Podkop
+
+```bash
 sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh)
 ```
 
-### Настройка в LuCI
+Установщик определяет пакетный менеджер сам (`command -v apk`), так что
+работает и на 24.10, и на 25.12. OpenWrt 23.05 не поддерживается начиная с
+Podkop 0.5.0.
 
-**Services → Podkop**
+Настройка в LuCI: **Services → Podkop**
 
-1. **Тип подключения:** `proxy`
-2. **Строка подключения:** вставь VLESS-ссылку:
-   ```
-   vless://UUID@СЕРВЕР:443?security=reality&sni=SNI&pbk=PUBLIC_KEY&sid=SHORT_ID#Название
-   ```
-3. **Список доменов:** `russia_inside`
-4. Включи и сохрани
+1. **Тип подключения** → `VPN`
+2. Интерфейс → `awg0`
+3. **Списки сообщества** → `Russia inside`
+4. **Service list** → при необходимости `youtube`, `meta`, `discord`, `telegram`
+5. Сохранить и применить
 
-Дополнительные списки: `youtube`, `meta`, `discord`, `telegram`.
+Если пункт не появился в меню:
 
-Торрент напрямую: в разделе **Protocol exclusions** выбери `bittorrent`.
+```bash
+rm -f /tmp/luci-indexcache*
+```
+
+### Торренты мимо VPN
+
+Многие VLESS/VPN-серверы запрещают BitTorrent. Отдельного переключателя по
+протоколу в Podkop нет, но он и не нужен: в туннель попадает только то, что
+перечислено в списках, всё остальное идёт напрямую. Соединения с пирами
+адресуются по IP и ни в один список не входят, поэтому торрент-трафик
+обходит VPN сам собой.
+
+Это отличается от ручного конфига sing-box, где по умолчанию всё уходит в
+туннель и торренты приходится вынимать явным правилом
+`{"protocol": "bittorrent", "outbound": "direct"}` первым в списке `rules`.
+
+Проверка — счётчики туннеля во время активной закачки:
+
+```bash
+awg show | grep transfer
+sleep 30
+awg show | grep transfer
+```
+
+Если домен трекера всё же входит в один из списков (заблокированные трекеры
+есть в `russia_inside`), через VPN пойдут только анонсы, обмен с пирами
+останется прямым. Чтобы вынуть и анонсы, добавляется вторая секция с типом
+**Exclusion** и доменами трекера — секции обрабатываются отдельно, и
+`Exclusion` имеет приоритет над списками основной секции.
 
 ---
 
-## Часть 4: WireGuard-сервер для подключения снаружи
+## Проверка результата
 
-### Требования
-
-- Белый IP от провайдера (проверить на 2ip.ru)
-- Если IP динамический — настроить DDNS (No-IP, DynDNS — бесплатно)
-
-### Установка WireGuard
+С клиента (не с роутера):
 
 ```bash
-opkg update
-opkg install wireguard-tools kmod-wireguard luci-app-wireguard
+scutil --dns | grep nameserver | head    # macOS: должен быть 192.168.1.1
+nslookup youtube.com                     # ждём 198.18.x.x — FakeIP
+nslookup ya.ru                           # ждём настоящий адрес
+curl -s https://ifconfig.me              # ждём IP провайдера, не сервера VPN
 ```
 
-### Генерация ключей
-
-```bash
-# Ключи сервера
-wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
-
-# Ключи клиента (телефона)
-wg genkey | tee /etc/wireguard/client_private.key | wg pubkey > /etc/wireguard/client_public.key
-
-# Посмотреть ключи
-cat /etc/wireguard/server_private.key   # → SERVER_PRIVATE
-cat /etc/wireguard/server_public.key    # → SERVER_PUBLIC
-cat /etc/wireguard/client_private.key   # → CLIENT_PRIVATE
-cat /etc/wireguard/client_public.key    # → CLIENT_PUBLIC
-```
-
-### Настройка WireGuard в LuCI
-
-**Network → Interfaces → Add new interface**
-- Имя: `wg0`
-- Протокол: `WireGuard VPN`
-
-Заполни:
-- Private Key: `SERVER_PRIVATE`
-- Listen Port: `51820`
-- IP адрес: `10.0.0.1/24`
-
-Добавь peer (телефон):
-- Public Key: `CLIENT_PUBLIC`
-- Allowed IPs: `10.0.0.2/32`
-
-### Настройка firewall
-
-**Network → Firewall → Add new zone:**
-- Имя: `wireguard`
-- Интерфейс: `wg0`
-- Input/Forward/Output: `Accept`
-
-Добавь forwarding: `wireguard → lan` и `wireguard → wan`
-
-### Конфиг для телефона
-
-Создай файл `/tmp/client.conf`:
-
-```ini
-[Interface]
-PrivateKey = CLIENT_PRIVATE
-Address = 10.0.0.2/24
-DNS = 10.0.0.1
-
-[Peer]
-PublicKey = SERVER_PUBLIC
-Endpoint = ТВОЙ_IP_ИЛИ_DDNS:51820
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-```
-
-Сгенерировать QR-код для импорта в приложение WireGuard на телефоне:
-```bash
-opkg install qrencode
-qrencode -t ansiutf8 < /tmp/client.conf
-```
-
-### Проброс порта на Archer AX55
-
-**Advanced → NAT Forwarding → Port Forwarding:**
-- Внешний порт: `51820` (UDP)
-- Внутренний IP: `192.168.1.1` (R3S)
-- Внутренний порт: `51820`
+Правильная картина: домены из списков резолвятся в `198.18.0.0/15` и идут в
+туннель, остальные — напрямую, поэтому внешний IP остаётся провайдерским.
 
 ---
 
-## Проверка
+## Грабли
 
-### Дома (через Wi-Fi)
+**`scp` не работает: `/usr/libexec/sftp-server: not found`**
+В dropbear нет SFTP, а современный `scp` по умолчанию работает поверх него.
+Помогает флаг `-O` (старый протокол) либо загрузка файла прямо на роутер
+через `wget`.
+
+**Клиент не использует роутер как DNS**
+Если на устройстве прописан внешний DNS (`8.8.8.8` и подобные), Podkop не
+увидит запрос и не подменит ответ — механизм не включится вообще. Убрать
+ручной DNS, оставить получение по DHCP. Побочный симптом: `NXDOMAIN` на
+заблокированных доменах — это ТСПУ подменяет ответ по пути к публичному
+резолверу.
+
+**`/etc/init.d/podkop status` показывает `not running`**
+Podkop — генератор конфигурации и правил, а не демон. Постоянно работающий
+процесс здесь один: `pgrep -f sing-box`, `service sing-box status`.
+
+**Валидность конфига sing-box**
+
 ```bash
-curl https://ifconfig.me  # IP VPN-сервера для заблокированных сайтов
+sing-box check -c /etc/sing-box/config.json    # молчит = всё в порядке
+logread -e podkop | tail -30
+logread -e sing-box | tail -30
 ```
 
-### На улице (через мобильный интернет)
-1. Включи WireGuard на телефоне
-2. Зайди на `ifconfig.me` — должен показать домашний IP
-3. Зайди на заблокированный сайт — должен открыться через VLESS
+**Мало места на overlay**
+Штатный squashfs-образ отдаёт под систему около 100 МБ независимо от размера
+карты. Для Podkop с sing-box хватает, но при добавлении AdGuard Home и
+прочего раздел стоит расширить на всю карту.
 
 ---
 
-## Логика маршрутизации
+## Что осталось за рамками
 
-| Трафик | Откуда | Путь |
-|--------|--------|------|
-| Заблокированные сайты | Дома | Через VLESS |
-| Обычные сайты | Дома | Напрямую |
-| Любой трафик | Телефон на улице | WireGuard → R3S → Podkop |
-| BitTorrent | Любое устройство | Напрямую |
-
----
-
-## Устранение проблем
-
-**Podkop не запускается:**
-```bash
-logread | grep podkop
-logread | grep sing-box
-```
-
-**LuCI не показывает Podkop:**
-```bash
-rm -f /var/luci-indexcache* /tmp/luci-indexcache*
-```
-
-**WireGuard не подключается снаружи:**
-- Проверь проброс порта на AX55
-- Проверь белый IP: `curl https://ifconfig.me` с R3S должен совпадать с тем что на AX55
-- Порт открыт: `ss -ulnp | grep 51820`
-
-**Телефон подключён к WireGuard но сайты не открываются:**
-- Проверь DNS в конфиге клиента: должен быть `10.0.0.1`
-- Проверь forwarding в firewall: `wireguard → wan`
+**Доступ снаружи (WireGuard-сервер на R3S).** Требует белого IP. Если
+провайдер выдаёт адрес из диапазона `100.64.0.0/10` — это CGNAT, входящие
+соединения невозможны, и DDNS не помогает (он решает проблему меняющегося
+адреса, а не отсутствия публичного). Варианты: заказать белый IP у
+провайдера либо поднять WireGuard на VPS и подключать к нему и R3S, и телефон.
