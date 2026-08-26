@@ -392,6 +392,90 @@ grep -o '"chains":\[[^]]*\]' /tmp/conn.json | sort | uniq -c
 `direct`, привязанный к интерфейсу, а туннелирование выполняет сам
 AmneziaWG на уровне сети.
 
+### Резервный канал при отказе
+
+Секции друг друга не подстраховывают: если канал секции умер, совпавшие с
+ней домены просто перестают открываться — отката на другую секцию нет.
+Встроенный `urltest` переключается только между прокси-ссылками, интерфейс
+VPN в него подставить нельзя (тип подключения `vpn` обрабатывается
+отдельной веткой кода).
+
+Обходится тем же порядком секций: опущенная ниже `main` секция перестаёт
+срабатывать, и домены достаются основному каналу. Настройки при этом
+сохраняются, переключение обратимо одной командой.
+
+Clash API даёт готовую проверку живости канала — тот же запрос, что стоит
+за кнопкой «Тестирование задержки»:
+
+```bash
+curl -s "http://192.168.1.1:9090/proxies/youtube-out/delay?timeout=8000&url=http://cp.cloudflare.com/generate_204"
+# {"delay":480} — канал жив
+```
+
+Адрес берётся из `external_controller` в конфиге sing-box; на loopback
+контроллер не слушает. Имена каналов — `curl -s http://192.168.1.1:9090/proxies`.
+
+Сторожевой скрипт `/root/yt-failover`:
+
+```sh
+#!/bin/sh
+API="http://192.168.1.1:9090"
+NAME="youtube-out"
+FAILS="/tmp/yt-failover.fails"
+THRESHOLD=2
+
+alive() {
+    curl -s --max-time 12 \
+        "$API/proxies/$NAME/delay?timeout=8000&url=http://cp.cloudflare.com/generate_204" \
+        | grep -q '"delay"'
+}
+
+first="$(uci show podkop | grep '=section' | head -1 | cut -d. -f2 | cut -d= -f1)"
+fails="$(cat $FAILS 2>/dev/null || echo 0)"
+
+if alive; then
+    echo 0 > "$FAILS"
+    want="youtube"
+else
+    fails=$((fails + 1))
+    echo "$fails" > "$FAILS"
+    if [ "$fails" -ge "$THRESHOLD" ]; then want="main"; else want="$first"; fi
+fi
+
+[ "$first" = "$want" ] && exit 0
+
+case "$want" in
+    youtube) uci reorder podkop.youtube=1 ;;
+    main)    uci reorder podkop.youtube=2 ;;
+esac
+
+uci commit podkop
+/etc/init.d/podkop restart
+logger -t yt-failover "YouTube switched to: $want"
+```
+
+```bash
+chmod +x /root/yt-failover
+echo '*/5 * * * * /root/yt-failover' >> /etc/crontabs/root
+/etc/init.d/cron restart
+```
+
+Порог в две неудачи подряд обязателен: каждое переключение перезапускает
+Podkop и обрывает трафик секунд на двадцать, так что метания из-за разовой
+сетевой икоты обошлись бы дороже самой проблемы. Возврат делается сразу при
+первом успехе.
+
+Проверить, не дожидаясь реального сбоя, можно подставным именем канала:
+
+```bash
+sed -i 's|NAME="youtube-out"|NAME="nonexistent"|' /root/yt-failover
+/root/yt-failover; /root/yt-failover
+uci show podkop | grep '=section'      # main должна стать первой
+logread -e yt-failover
+sed -i 's|NAME="nonexistent"|NAME="youtube-out"|' /root/yt-failover
+/root/yt-failover
+```
+
 ### Торренты мимо VPN
 
 Многие VLESS/VPN-серверы запрещают BitTorrent. Отдельного переключателя по
