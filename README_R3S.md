@@ -511,6 +511,53 @@ sed -i 's|NAME="nonexistent"|NAME="youtube-out"|' /root/yt-failover
 /root/yt-failover
 ```
 
+### Прокси через туннель, когда сервер заблокирован
+
+Провайдер может блокировать сам прокси-сервер — тогда секция встаёт целиком,
+хотя сервер жив. Отличается от отказа сервера одной проверкой:
+
+```bash
+curl -sS --max-time 8 --connect-timeout 6 -o /dev/null https://СЕРВЕР; echo "прямо: $?"
+curl -sS --max-time 10 --connect-timeout 8 --interface awg0 -o /dev/null https://СЕРВЕР; echo "через awg0: $?"
+```
+
+Код `28` напрямую и `35` или `60` через туннель означает, что до сервера не
+пускает провайдер: TCP через туннель проходит, а споткнулись уже на TLS, что
+для VLESS-сервера при обращении обычным curl нормально.
+
+Обходится цепочкой: подключение к прокси устанавливается через уже
+работающий туннель, а наружу трафик выходит с адреса прокси.
+
+```
+Клиент → sing-box → awg0 (Amnezia) → VLESS → сервис
+```
+
+В sing-box это параметр `detour`, ссылкой его не выразить — нужен тип
+конфигурации `outbound` с описанием в JSON. Заодно там выражаются
+нестандартные заголовки WebSocket, которые тоже теряются при разборе ссылки.
+
+```bash
+uci set podkop.youtube.proxy_config_type='outbound'
+uci set podkop.youtube.outbound_json='{"type":"vless","server":"СЕРВЕР","server_port":443,"uuid":"UUID","detour":"main-out","tls":{"enabled":true,"server_name":"SNI","utls":{"enabled":true,"fingerprint":"firefox"}},"transport":{"type":"ws","path":"/","headers":{"bullet":"true"}}}'
+uci commit podkop
+/etc/init.d/podkop restart
+```
+
+`main-out` — имя исходящего секции `main`, привязанного к `awg0`; список имён
+даёт `curl -s http://192.168.1.1:9090/proxies`.
+
+Двойное туннелирование обходится дешевле, чем кажется: на практике задержка
+цепочки оказалась даже меньше, чем у самого туннеля напрямую (395 мс против
+443 мс).
+
+Переключаться между прямым подключением и цепочкой можно одной строкой —
+`proxy_string` и `outbound_json` хранятся независимо:
+
+```bash
+uci set podkop.youtube.proxy_config_type='url'      # напрямую
+uci set podkop.youtube.proxy_config_type='outbound' # через туннель
+```
+
 ### Торренты мимо VPN
 
 Многие VLESS/VPN-серверы запрещают BitTorrent. Отдельного переключателя по
