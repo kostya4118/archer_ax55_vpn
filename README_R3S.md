@@ -582,6 +582,82 @@ uci set podkop.youtube.proxy_config_type='url'      # напрямую
 uci set podkop.youtube.proxy_config_type='outbound' # через туннель
 ```
 
+### Резерв для основного канала
+
+Тот же приём годится и для основной секции: заводится третья секция с
+резервным прокси и **теми же списками**, что у `main`, и ставится последней.
+Пока Amnezia жива, до неё очередь не доходит; когда падает — сторож
+поднимает её наверх.
+
+Так надёжнее, чем переписывать `connection_type` у существующей секции:
+настройки `main` не трогаются вовсе, а переключение сводится к перестановке.
+
+Здоровье туннеля проверяется пингом **сквозь интерфейс**, а не через Clash
+API: после перестановки `main-out` перестаёт быть каналом Amnezia, и
+проверять через него нечего.
+
+```sh
+#!/bin/sh
+FAILS="/tmp/main-failover.fails"
+THRESHOLD=5
+
+[ -f /tmp/main-manual ] && exit 0
+
+alive() {
+    ping -c 2 -W 3 -I awg0 1.1.1.1 >/dev/null 2>&1
+}
+
+cur=""
+for s in $(uci show podkop | grep '=section' | cut -d. -f2 | cut -d= -f1); do
+    case "$s" in
+        main|backup) cur="$s"; break ;;
+    esac
+done
+
+fails="$(cat $FAILS 2>/dev/null || echo 0)"
+
+if alive; then
+    echo 0 > "$FAILS"
+    want="main"
+else
+    fails=$((fails + 1))
+    echo "$fails" > "$FAILS"
+    if [ "$fails" -ge "$THRESHOLD" ]; then want="backup"; else want="$cur"; fi
+fi
+
+[ "$cur" = "$want" ] && exit 0
+
+uci reorder podkop.$want=1
+uci commit podkop
+/etc/init.d/podkop restart
+logger -t main-failover "переключено на: $want"
+```
+
+Скрипт не хранит состояние отдельно — он смотрит, какая из двух секций
+стоит выше, и приводит порядок в соответствие с состоянием туннеля.
+Позиции задаются относительно (`reorder ...=1`), поэтому количество секций
+значения не имеет.
+
+Проверка на подставном отказе:
+
+```bash
+ifdown awg0
+for i in 1 2 3 4 5; do /root/main-failover; sleep 2; done
+uci show podkop | grep '=section'     # backup должна стать первой
+ifup awg0; sleep 20; /root/main-failover
+```
+
+**Взаимодействие сторожей.** Секция под отдельный сервис, привязанная к
+`awg0` через `bind_interface`, умирает вместе с туннелем — её собственный
+сторож опустит её вниз, и домены достанутся резерву. Скрипты не конфликтуют,
+поскольку переставляют разные секции, но Podkop перезапустится дважды
+подряд. Чтобы резерв встал раньше, расписание сдвигается:
+
+```
+* * * * * /root/main-failover
+* * * * * sleep 30; /root/yt-failover
+```
+
 ### Торренты мимо VPN
 
 Многие VLESS/VPN-серверы запрещают BitTorrent. Отдельного переключателя по
