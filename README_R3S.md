@@ -1309,6 +1309,199 @@ Firmware → Restore**), пакеты придётся установить за
 
 ---
 
+## Часть 7. Управление через Telegram-бота
+
+Бот на роутере решает задачу, которая иначе упирается в белый IP:
+**long polling — исходящее соединение**. Роутер сам ходит на
+`api.telegram.org` за обновлениями, входящих не требуется, и CGNAT не
+мешает. Webhook, наоборот, без внешнего адреса не работает.
+
+Ограничение честное: бот живёт на том же канале, что и всё остальное.
+Частичный отказ он переживёт — при падении Amnezia поднимется резерв, — а
+при полном отказе связи замолчит вместе с ней. Как сирена «всё лежит» он
+не годится по построению.
+
+### Проверка доступности API
+
+`api.telegram.org` из России не открывается, а Podkop по умолчанию
+перехватывает трафик клиентов сети, а не порождённый самим роутером —
+для собственного трафика у него отдельная настройка (цепочка
+`mangle_output`). Проверять надо методом API, а не корнем сайта: на `/`
+приходит `302` от nginx, и точно так же выглядит подмена провайдером.
+
+```bash
+curl -s -m 15 https://api.telegram.org/bot0:0/getMe; echo
+# {"ok":false,"error_code":401,"description":"Unauthorized: invalid token specified"}
+```
+
+Такой ответ отдаёт только настоящий API. Отдельно проверять сертификат
+незачем: `curl` не промолчал бы при подмене.
+
+### Токен и chat_id
+
+Бот заводится у `@BotFather` (`/newbot`). Дальше нужно **написать боту
+сообщение** — иначе `getUpdates` вернёт пустой список и id взять неоткуда.
+
+```bash
+printf '%s' 'ТОКЕН' > /root/.tg-token
+chmod 600 /root/.tg-token
+curl -s "https://api.telegram.org/bot$(cat /root/.tg-token)/getMe"; echo
+curl -s "https://api.telegram.org/bot$(cat /root/.tg-token)/getUpdates"; echo
+```
+
+`getMe` с `"ok":true` подтверждает, что токен записался целиком — важно,
+потому что клиенты любят подменять кавычки и дефисы. `chat_id` берётся из
+`message.from.id`.
+
+`jsonfilter` в OpenWrt не понимает подстановку `[*]` в пути, поэтому
+массив обновлений перебирается по индексу.
+
+### Отправка сообщений
+
+```sh
+#!/bin/sh
+[ -f /root/.tg-token ] || exit 0
+curl -s --max-time 20 \
+  "https://api.telegram.org/bot$(cat /root/.tg-token)/sendMessage" \
+  --data-urlencode "chat_id=$(cat /root/.tg-chat)" \
+  --data-urlencode "text=$1" >/dev/null 2>&1
+```
+
+`--data-urlencode` обязателен: без него сообщение с `&` или переводом
+строки развалит запрос.
+
+Отдельный `/root/tg-send` полезен сам по себе — строка рядом с `logger` в
+сторожах превращает молчаливое переключение канала в уведомление:
+
+```sh
+/root/tg-send "основной канал переключён на: $want"
+```
+
+### Бот
+
+Разбирать команды надо **строгим списком**, а не выполнять пришедший
+текст: токен в чужих руках иначе означает root на роутере. Второй рубеж —
+сверка `from.id` с сохранённым `chat_id`.
+
+```sh
+#!/bin/sh
+TOKEN="$(cat /root/.tg-token 2>/dev/null)"
+CHAT="$(cat /root/.tg-chat 2>/dev/null)"
+[ -n "$TOKEN" ] && [ -n "$CHAT" ] || { echo "нет токена или chat_id"; exit 1; }
+API="https://api.telegram.org/bot$TOKEN"
+OFFSET_F=/tmp/tg-bot.offset
+
+send() {
+    curl -s --max-time 25 "$API/sendMessage" \
+        --data-urlencode "chat_id=$CHAT" \
+        --data-urlencode "text=$1" >/dev/null 2>&1
+}
+
+handle() {
+    cmd="$1"; arg="$2"
+    case "$cmd" in
+        /start|/help) send "$HELP" ;;
+        /diag) send "$(/root/diag 2>&1 | head -c 3500)" ;;
+        /log)  send "$(logread 2>/dev/null | grep failover | tail -15 | head -c 3500)" ;;
+        /yt)
+            case "$arg" in
+                vless)   /root/yt-vless   >/dev/null 2>&1; send "YouTube через VLESS" ;;
+                amnezia) /root/yt-amnezia >/dev/null 2>&1; send "YouTube через Amnezia" ;;
+                auto)    /root/yt-auto    >/dev/null 2>&1; send "YouTube в автоматике" ;;
+                *) send "нужно: /yt vless | amnezia | auto" ;;
+            esac ;;
+        /add)
+            [ -n "$arg" ] || { send "нужно: /add домен-или-подсеть"; return; }
+            send "$(/root/podkop-add "$arg" 2>&1 | head -c 3500)" ;;
+        /reboot)
+            if [ "$arg" = "yes" ]; then
+                send "перезагружаюсь"; sleep 2; reboot
+            else
+                send "подтверди: /reboot yes"
+            fi ;;
+        *) send "не понял. /help" ;;
+    esac
+}
+
+send "бот запущен"
+
+while :; do
+    off="$(cat $OFFSET_F 2>/dev/null || echo 0)"
+    upd="$(curl -s --max-time 70 "$API/getUpdates?offset=$off&timeout=60")"
+    echo "$upd" | grep -q '"ok":true' || { sleep 5; continue; }
+
+    n=0
+    while :; do
+        uid="$(echo "$upd" | jsonfilter -e "@.result[$n].update_id" 2>/dev/null)"
+        [ -n "$uid" ] || break
+        from="$(echo "$upd" | jsonfilter -e "@.result[$n].message.from.id" 2>/dev/null)"
+        text="$(echo "$upd" | jsonfilter -e "@.result[$n].message.text" 2>/dev/null)"
+        echo $((uid + 1)) > "$OFFSET_F"
+        n=$((n + 1))
+
+        [ "$from" = "$CHAT" ] || continue
+        [ -n "$text" ] || continue
+
+        set -- $text
+        handle "$1" "$2"
+    done
+done
+```
+
+**Смещение сохраняется до выполнения команды.** Иначе команда, роняющая
+бота, выполнялась бы снова после каждого перезапуска — бесконечная петля
+из одного сообщения. Особенно неприятно с `/reboot`.
+
+Предел сообщения — 4096 символов, отсюда `head -c 3500`. Вывод `diag`
+занимает около 2600, запас на добавление разделов небольшой.
+
+Опасные команды требуют подтверждения отдельным словом: `/reboot yes`.
+Промах по кнопке не должен уводить роутер в перезагрузку на полторы минуты.
+
+### Автозапуск
+
+```sh
+#!/bin/sh /etc/rc.common
+START=95
+USE_PROCD=1
+start_service() {
+    procd_open_instance
+    procd_set_param command /root/tg-bot
+    procd_set_param respawn 3600 10 0
+    procd_set_param stderr 1
+    procd_close_instance
+}
+```
+
+`respawn 3600 10 0` — поднимать бесконечно с паузой 10 секунд. Это не
+украшение: при обрыве туннеля бот умирает, и вернуться он должен сам.
+
+**Пробный запуск в переднем плане перехватывает stdin.** Вставленные
+следом команды уходят в бота и молча пропадают — перед продолжением нужен
+Ctrl+C и возврат приглашения.
+
+### Сохранение при обновлении прошивки
+
+Всё написанное лежит в `/root` и при `sysupgrade` не переживает
+обновления. Список сохраняемого:
+
+```
+/root/diag
+/root/tg-bot
+/root/tg-send
+/root/yt-failover
+/root/yt-vless
+/root/yt-amnezia
+/root/yt-auto
+/root/main-failover
+/root/podkop-add
+/root/.tg-token
+/root/.tg-chat
+/etc/init.d/tgbot
+```
+
+---
+
 ## Что осталось за рамками
 
 **Доступ снаружи (WireGuard-сервер на R3S).** Требует белого IP. Если
@@ -1316,3 +1509,7 @@ Firmware → Restore**), пакеты придётся установить за
 соединения невозможны, и DDNS не помогает (он решает проблему меняющегося
 адреса, а не отсутствия публичного). Варианты: заказать белый IP у
 провайдера либо поднять WireGuard на VPS и подключать к нему и R3S, и телефон.
+
+Для *управления* роутером снаружи это не нужно — Telegram-бот из части 7
+работает на исходящих соединениях. Белый IP остаётся нужен только для
+доступа к самой домашней сети: файлам, камерам, веб-интерфейсам устройств.
