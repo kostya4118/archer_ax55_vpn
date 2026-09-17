@@ -35,26 +35,50 @@ done
 echo
 
 # --- Реальный проходящий размер пакета через туннель --------------------------
-echo "${BLD}Какой размер пакета реально проходит через ${WG_IF}${RST}"
+# Важно: пакет крупнее MTU самого интерфейса не уйдёт в принципе — его отвергнет
+# ядро, а не путь. Поэтому тестируем только размеры, влезающие в текущий MTU,
+# иначе получим ложную тревогу "путь не пропускает".
+CUR_MTU="$(ip link show "${WG_IF}" | awk '/mtu/ {for(n=1;n<=NF;n++) if($n=="mtu") print $(n+1)}')"
+echo "${BLD}Какой размер пакета реально проходит через ${WG_IF} (MTU ${CUR_MTU})${RST}"
 hr
-BEST=0
-for SIZE in 1200 1280 1350 1372 1412; do
+BEST=0; FAILED_BELOW_MTU=0
+for SIZE in 1200 1280 1350 1372 1412 1452; do
+  if [[ $((SIZE+28)) -gt "${CUR_MTU}" ]]; then
+    echo "  ${SIZE} байт (MTU $((SIZE+28))) — пропуск, больше MTU интерфейса"
+    continue
+  fi
   if ping -M do -s "${SIZE}" -c 1 -W 3 -I "${WG_IF}" 1.1.1.1 >/dev/null 2>&1; then
     echo "  ${SIZE} байт (MTU $((SIZE+28))) — ${GRN}проходит${RST}"
     BEST="${SIZE}"
   else
     echo "  ${SIZE} байт (MTU $((SIZE+28))) — ${YLW}НЕ проходит${RST}"
+    FAILED_BELOW_MTU=1
   fi
 done
-if [[ "${BEST}" != "0" ]]; then
-  echo
-  echo "  Максимальный рабочий MTU через туннель: ${BLD}$((BEST+28))${RST}"
-  CUR_MTU="$(ip link show "${WG_IF}" | awk '/mtu/ {for(n=1;n<=NF;n++) if($n=="mtu") print $(n+1)}')"
-  if [[ -n "${CUR_MTU}" && "${CUR_MTU}" -gt "$((BEST+28))" ]]; then
-    warn "MTU интерфейса (${CUR_MTU}) БОЛЬШЕ реально проходящего ($((BEST+28)))."
-    warn "Это и есть причина тормозов: крупные пакеты молча теряются."
-    warn "Лечится:  ip link set ${WG_IF} mtu $((BEST+28))"
-  fi
+echo
+if [[ "${FAILED_BELOW_MTU}" == "1" ]]; then
+  warn "Часть пакетов МЕНЬШЕ MTU интерфейса не проходит — MTU всё ещё завышен."
+  warn "Попробуй снизить:  ip link set ${WG_IF} mtu $((BEST+28))"
+elif [[ "${BEST}" != "0" ]]; then
+  echo "  ${GRN}Всё, что влезает в MTU ${CUR_MTU}, проходит — с MTU порядок.${RST}"
+fi
+echo
+
+# --- QUIC / HTTP3 -------------------------------------------------------------
+# YouTube активно использует QUIC (UDP 443). Если он не ходит, браузер сначала
+# ждёт таймаут и только потом падает на TCP — это выглядит как "долго грузится",
+# особенно на Shorts, где каждый ролик открывает новые соединения.
+echo "${BLD}QUIC (UDP 443) от клиентов${RST}"
+hr
+UDP_PKTS="$(iptables -t mangle -L PREROUTING -n -v 2>/dev/null \
+  | awk '/udp dpt:443/ {print $1; exit}' || echo "?")"
+TCP_PKTS="$(iptables -t mangle -L PREROUTING -n -v 2>/dev/null \
+  | awk '/tcp dpt:443/ {print $1; exit}' || echo "?")"
+echo "  промаркировано пакетов:  TCP=${TCP_PKTS}   UDP=${UDP_PKTS}"
+if [[ "${UDP_PKTS}" == "0" && "${TCP_PKTS}" != "0" ]]; then
+  warn "UDP-трафика нет вообще, хотя TCP идёт."
+  warn "Скорее всего QUIC не доходит — браузер каждый раз ждёт таймаут перед"
+  warn "откатом на TCP. Для Shorts это заметная задержка на каждом ролике."
 fi
 echo
 
