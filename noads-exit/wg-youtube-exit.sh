@@ -97,6 +97,38 @@ if [[ "${HS:-0}" == "0" ]]; then
   warn "либо сервер недоступен. Проверить:  wg show ${WG_IF}"
 fi
 
+# --- 3a. Подбираем рабочий MTU ------------------------------------------------
+# Туннели вложенные (клиент -> Amnezia -> singbox0 -> wgru), заголовки
+# складываются. Если MTU интерфейса больше реально проходящего, крупные пакеты
+# молча теряются — соединение живое, но видео буферизует. Поэтому меряем
+# фактический предел пингом с запретом фрагментации и ставим его с запасом.
+info "Подбираю рабочий MTU для ${WG_IF}..."
+BEST_PAYLOAD=0
+for SIZE in 1212 1252 1292 1332 1372 1412 1452; do
+  if ping -M do -s "${SIZE}" -c 1 -W 2 -I "${WG_IF}" 1.1.1.1 >/dev/null 2>&1; then
+    BEST_PAYLOAD="${SIZE}"
+  else
+    break
+  fi
+done
+
+if [[ "${BEST_PAYLOAD}" -gt 0 ]]; then
+  # payload + 8 (ICMP) + 20 (IP) = рабочий MTU; минус 20 байт запаса на то,
+  # что путь до Google может оказаться чуть уже, чем до 1.1.1.1
+  SAFE_MTU=$(( BEST_PAYLOAD + 28 - 20 ))
+  info "Максимум проходит $(( BEST_PAYLOAD + 28 )), ставлю ${SAFE_MTU} (с запасом)."
+  ip link set "${WG_IF}" mtu "${SAFE_MTU}" 2>/dev/null || warn "Не удалось применить MTU на лету."
+  # Закрепляем в конфиге, чтобы пережило перезапуск
+  if grep -qE '^[[:space:]]*MTU[[:space:]]*=' "/etc/wireguard/${WG_IF}.conf"; then
+    sed -i "s/^[[:space:]]*MTU[[:space:]]*=.*/MTU = ${SAFE_MTU}/" "/etc/wireguard/${WG_IF}.conf"
+  else
+    sed -i "/^\[Interface\]/a MTU = ${SAFE_MTU}" "/etc/wireguard/${WG_IF}.conf"
+  fi
+else
+  warn "Не удалось измерить MTU (ICMP закрыт?) — оставляю как есть."
+  warn "Если видео будет буферизовать, попробуй вручную: ip link set ${WG_IF} mtu 1380"
+fi
+
 # --- 4. Ставим sing-box, если нужно ------------------------------------------
 if ! command -v sing-box >/dev/null 2>&1; then
   info "Устанавливаю sing-box..."
