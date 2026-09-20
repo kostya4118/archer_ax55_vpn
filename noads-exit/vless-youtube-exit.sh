@@ -298,7 +298,10 @@ chmod +x "${ROUTE_UP}"
 mkdir -p /etc/systemd/system/sing-box.service.d
 cat > /etc/systemd/system/sing-box.service.d/noads-route.conf <<EOF
 [Service]
-ExecStartPost=${ROUTE_UP}
+# Префикс "+" — выполнить с полными правами, игнорируя User= юнита. Свежие
+# пакеты sing-box гоняют службу под отдельным пользователем sing-box, а
+# хелперу нужны root-права на ip rule / iptables (иначе 203/EXEC).
+ExecStartPost=+${ROUTE_UP}
 EOF
 
 # --- 5. Отключаем албанский туннель (конфиг остаётся для отката) -------------
