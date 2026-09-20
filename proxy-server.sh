@@ -7,7 +7,7 @@
 # маршрутизации sing-box, что и трафик VPN-клиентов: ютуб-домены сами уходят в
 # no-ads туннель по SNI. Отдельная маркировка по --uid-owner не нужна.
 #
-# Настройки сохраняются в /etc/sing-box/proxy-server.json и подхватываются при
+# Настройки сохраняются в /etc/noads-proxy.json и подхватываются при
 # перегенерации конфига скриптами *-youtube-exit.sh — то есть переживают смену
 # ключа или WG-выхода.
 #
@@ -23,8 +23,12 @@ set -euo pipefail
 
 CONF_DIR="/etc/sing-box"
 CONF="${CONF_DIR}/config.json"
-FRAGMENT="${CONF_DIR}/proxy-server.json"
-LEGACY_FRAGMENT="${CONF_DIR}/socks-server.json"   # от прежней версии скрипта
+# ВАЖНО: фрагмент лежит ВНЕ /etc/sing-box. Служба стартует с "-C /etc/sing-box",
+# то есть sing-box читает оттуда ВСЕ .json и сливает в один конфиг — посторонний
+# файл в этой папке роняет запуск ("cannot unmarshal array into option._Options").
+FRAGMENT="/etc/noads-proxy.json"
+# Прежние версии клали фрагмент внутрь /etc/sing-box — их надо убрать оттуда.
+LEGACY_FRAGMENTS=("${CONF_DIR}/proxy-server.json" "${CONF_DIR}/socks-server.json")
 HTTP_TAG="http-public"
 SOCKS_TAG="socks-public"
 
@@ -52,10 +56,19 @@ done
 
 [[ -f "${CONF}" ]] || { err "Нет ${CONF} — сначала настрой YouTube-роутинг."; exit 1; }
 
+# Подбираем за прежними версиями: фрагмент в каталоге конфигов ломает запуск
+for _old in "${LEGACY_FRAGMENTS[@]}"; do
+  if [[ -f "${_old}" ]]; then
+    warn "Убираю фрагмент из каталога конфигов: ${_old}"
+    [[ -f "${FRAGMENT}" ]] || mv -f "${_old}" "${FRAGMENT}"
+    rm -f "${_old}"
+  fi
+done
+
 # --- Выключение ----------------------------------------------------------------
 if [[ "${OFF}" == "1" ]]; then
   info "Выключаю прокси..."
-  rm -f "${FRAGMENT}" "${LEGACY_FRAGMENT}"
+  rm -f "${FRAGMENT}" "${LEGACY_FRAGMENTS[@]}"
   python3 - "${CONF}" "${HTTP_TAG}" "${SOCKS_TAG}" <<'PYEOF'
 import json, sys
 path = sys.argv[1]
@@ -122,7 +135,6 @@ elif ptype == "both":
 json.dump(inbounds, open(frag_path, "w"), indent=2, ensure_ascii=False)
 PYEOF
 chmod 600 "${FRAGMENT}"
-rm -f "${LEGACY_FRAGMENT}"
 
 # --- Вставляем в боевой конфиг --------------------------------------------------
 NEW_CONF="${CONF}.new"

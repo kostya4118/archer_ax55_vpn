@@ -197,16 +197,24 @@ cfg = {
 }
 # Публичные инбаунды прокси (proxy-server.sh) лежат отдельным фрагментом,
 # чтобы переживать перегенерацию конфига при смене ключа/выхода.
-for _frag in ("/etc/sing-box/proxy-server.json",
-              "/etc/sing-box/socks-server.json"):   # второй — от старой версии
-    if not os.path.exists(_frag):
-        continue
+# Файл намеренно ВНЕ /etc/sing-box: служба стартует с "-C /etc/sing-box" и
+# читает оттуда все .json как части конфига — посторонний файл там роняет
+# запуск. Старые версии клали его туда, поэтому заодно переносим.
+_legacy = ["/etc/sing-box/proxy-server.json", "/etc/sing-box/socks-server.json"]
+_frag = "/etc/noads-proxy.json"
+for _old in _legacy:
+    if os.path.exists(_old):
+        if not os.path.exists(_frag):
+            os.replace(_old, _frag)
+        else:
+            os.remove(_old)
+
+if os.path.exists(_frag):
     try:
         _ib = json.load(open(_frag))
         cfg["inbounds"].extend(_ib if isinstance(_ib, list) else [_ib])
     except Exception as e:
         print(f"  (фрагмент прокси пропущен: {e})")
-    break
 
 with open(out_path, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
