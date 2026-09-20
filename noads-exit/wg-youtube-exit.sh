@@ -195,14 +195,18 @@ cfg = {
         "auto_detect_interface": True
     }
 }
-# Публичный SOCKS-инбаунд (socks-server.sh) хранится отдельным фрагментом,
+# Публичные инбаунды прокси (proxy-server.sh) лежат отдельным фрагментом,
 # чтобы переживать перегенерацию конфига при смене ключа/выхода.
-_frag = "/etc/sing-box/socks-server.json"
-if os.path.exists(_frag):
+for _frag in ("/etc/sing-box/proxy-server.json",
+              "/etc/sing-box/socks-server.json"):   # второй — от старой версии
+    if not os.path.exists(_frag):
+        continue
     try:
-        cfg["inbounds"].append(json.load(open(_frag)))
+        _ib = json.load(open(_frag))
+        cfg["inbounds"].extend(_ib if isinstance(_ib, list) else [_ib])
     except Exception as e:
-        print(f"  (SOCKS-фрагмент пропущен: {e})")
+        print(f"  (фрагмент прокси пропущен: {e})")
+    break
 
 with open(out_path, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
