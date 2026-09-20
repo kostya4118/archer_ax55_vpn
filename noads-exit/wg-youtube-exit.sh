@@ -148,7 +148,7 @@ info "Генерирую конфиг sing-box (ютуб -> ${WG_IF}, остал
 mkdir -p "${CONF_DIR}"
 NEW_CONF="${CONF_DIR}/config.json.new"
 python3 - "${NEW_CONF}" "${TUN_IF}" "${TUN_ADDR}" "${TUN_MTU}" "${WG_IF}" <<'PYEOF'
-import json, sys
+import json, os, sys
 
 out_path, tun_if, tun_addr, tun_mtu, wg_if = sys.argv[1:6]
 
@@ -195,6 +195,15 @@ cfg = {
         "auto_detect_interface": True
     }
 }
+# Публичный SOCKS-инбаунд (socks-server.sh) хранится отдельным фрагментом,
+# чтобы переживать перегенерацию конфига при смене ключа/выхода.
+_frag = "/etc/sing-box/socks-server.json"
+if os.path.exists(_frag):
+    try:
+        cfg["inbounds"].append(json.load(open(_frag)))
+    except Exception as e:
+        print(f"  (SOCKS-фрагмент пропущен: {e})")
+
 with open(out_path, "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 
