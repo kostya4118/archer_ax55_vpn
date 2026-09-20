@@ -66,17 +66,24 @@ mkdir -p /etc/wireguard
 
 # DNS= убираем: wg-quick иначе перепишет резолвер сервера через resolvconf
 # и положит DNS всем VPN-клиентам. Table=off — чтобы не трогал маршруты.
+# Пишем через временный файл: источником может быть сам /etc/wireguard/<if>.conf,
+# и прямое перенаправление обнулило бы его до того, как awk успеет прочитать.
+TMP_CONF="$(mktemp)"
 awk '
   /^[[:space:]]*DNS[[:space:]]*=/  { next }
   /^[[:space:]]*Table[[:space:]]*=/ { next }
   { print }
   /^\[Interface\][[:space:]]*$/    { print "Table = off" }
-' "${SRC_CONF}" > "/etc/wireguard/${WG_IF}.conf"
+' "${SRC_CONF}" > "${TMP_CONF}"
 
-grep -q '^Table = off' "/etc/wireguard/${WG_IF}.conf" || {
-  err "Не удалось вставить 'Table = off' — проверь формат конфига."
+if ! grep -q '^Table = off' "${TMP_CONF}"; then
+  rm -f "${TMP_CONF}"
+  err "Не удалось вставить 'Table = off' — проверь формат конфига"
+  err "(нужна строка [Interface] на отдельной строке)."
   exit 1
-}
+fi
+mv -f "${TMP_CONF}" "/etc/wireguard/${WG_IF}.conf"
+
 chmod 600 "/etc/wireguard/${WG_IF}.conf"
 
 # --- 3. Поднимаем интерфейс ---------------------------------------------------

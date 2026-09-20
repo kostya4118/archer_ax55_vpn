@@ -25,12 +25,17 @@ err()  { echo "${RED}[x]${RST} $*" >&2; }
 
 MODE="${1:-}"
 
+# Временная папка объявлена глобально: trap срабатывает уже после выхода из
+# функции, и локальная переменная к тому моменту не видна (set -u -> падение).
+WORKDIR=""
+cleanup() { [[ -n "${WORKDIR}" ]] && rm -rf "${WORKDIR}"; return 0; }
+trap cleanup EXIT
+
 # --- BACKUP -------------------------------------------------------------------
 do_backup() {
   local stamp; stamp="$(date +%Y%m%d-%H%M)"
-  local work; work="$(mktemp -d)"
+  WORKDIR="$(mktemp -d)"; local work="${WORKDIR}"
   local out="/root/noads-backup-${stamp}.tar.gz"
-  trap 'rm -rf "${work}"' EXIT
 
   info "Собираю конфиги..."
   mkdir -p "${work}/wireguard" "${work}/sing-box" "${work}/dante"
@@ -106,8 +111,7 @@ do_restore() {
     exit 1
   fi
 
-  local work; work="$(mktemp -d)"
-  trap 'rm -rf "${work}"' EXIT
+  WORKDIR="$(mktemp -d)"; local work="${WORKDIR}"
   tar xzf "${archive}" -C "${work}"
 
   info "Ставлю пакеты..."
