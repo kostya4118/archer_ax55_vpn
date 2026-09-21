@@ -54,7 +54,38 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -f "${CONF}" ]] || { err "Нет ${CONF} — сначала настрой YouTube-роутинг."; exit 1; }
+# --- sing-box: ставим и заводим минимальный конфиг, если его ещё нет ----------
+# Скрипт должен работать и на сервере без YouTube-роутинга — например, на
+# старом, где прокси нужен сам по себе. Если конфиг уже есть, он не трогается:
+# прокси просто добавляется к нему отдельным inbound'ом.
+if [[ "${OFF}" == "0" ]] && ! command -v sing-box >/dev/null 2>&1; then
+  info "Устанавливаю sing-box..."
+  curl -fsSL https://sing-box.app/install.sh | sh
+  command -v sing-box >/dev/null 2>&1 || { err "sing-box не установился"; exit 1; }
+fi
+
+if [[ ! -f "${CONF}" ]]; then
+  [[ "${OFF}" == "1" ]] && { err "Нет ${CONF} — выключать нечего."; exit 1; }
+  info "Конфига ${CONF} нет — создаю минимальный (весь трафик напрямую)."
+  mkdir -p "${CONF_DIR}"
+  cat > "${CONF}" <<'JSONEOF'
+{
+  "log": { "level": "warn" },
+  "inbounds": [],
+  "outbounds": [
+    { "type": "direct", "tag": "direct-out" }
+  ],
+  "route": {
+    "rules": [
+      { "action": "sniff" }
+    ],
+    "final": "direct-out",
+    "auto_detect_interface": true
+  }
+}
+JSONEOF
+  systemctl enable sing-box >/dev/null 2>&1 || true
+fi
 
 # Подбираем за прежними версиями: фрагмент в каталоге конфигов ломает запуск
 for _old in "${LEGACY_FRAGMENTS[@]}"; do
@@ -107,6 +138,13 @@ else
   warn "Прокси будет БЕЗ пароля и доступен всему интернету."
   warn "Его найдут сканеры и начнут гонять чужой трафик от имени сервера —"
   warn "за это хостеры блокируют VPS. Лучше задай --user и --pass."
+fi
+
+# --- Dante: выключаем, его заменяет этот прокси ---------------------------------
+if systemctl list-unit-files 2>/dev/null | grep -q '^danted' \
+   && systemctl is-active --quiet danted 2>/dev/null; then
+  info "Останавливаю danted — порт освобождается под новый прокси."
+  systemctl disable --now danted >/dev/null 2>&1 || warn "Не удалось остановить danted."
 fi
 
 # --- Собираем фрагмент ----------------------------------------------------------
