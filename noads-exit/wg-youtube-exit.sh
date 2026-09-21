@@ -231,18 +231,17 @@ fi
 info "Конфиг валиден."
 mv -f "${NEW_CONF}" "${CONF_DIR}/config.json"
 
-# --- 6. Маркировка трафика VPN-клиентов --------------------------------------
-info "Настраиваю маркировку HTTPS/QUIC-трафика от VPN-клиентов (${BRIDGE_IF})..."
-for proto in tcp udp; do
-  iptables -t mangle -C PREROUTING -i "${BRIDGE_IF}" -p "${proto}" --dport 443 -j MARK --set-mark "${FWMARK}" 2>/dev/null || \
-    iptables -t mangle -A PREROUTING -i "${BRIDGE_IF}" -p "${proto}" --dport 443 -j MARK --set-mark "${FWMARK}"
-done
-
-# --- 7. Хелпер policy routing (вызывается systemd после старта sing-box) ------
+# --- 6-7. Хелпер policy routing (вызывается systemd после старта sing-box) ----
+# Все правила netfilter ставит именно хелпер, а не этот скрипт напрямую: тогда
+# они восстанавливаются при каждом старте sing-box — после перезагрузки, после
+# `iptables -F`, после рестарта Docker. Сохранять их через netfilter-persistent
+# не нужно и даже вредно: сохранённая копия тащит за собой правила Docker,
+# которые при загрузке накатываются раньше самого Docker.
+info "Готовлю хелпер маршрутизации и маркировки (${BRIDGE_IF} -> ${TUN_IF})..."
 cat > "${ROUTE_UP}" <<EOF
 #!/usr/bin/env bash
 set -eu
-TUN_IF="${TUN_IF}"; FWMARK="${FWMARK}"; RT_TABLE="${RT_TABLE}"
+TUN_IF="${TUN_IF}"; FWMARK="${FWMARK}"; RT_TABLE="${RT_TABLE}"; BRIDGE_IF="${BRIDGE_IF}"
 for _ in \$(seq 1 60); do
   ip link show "\${TUN_IF}" >/dev/null 2>&1 && break
   sleep 0.25
@@ -254,6 +253,11 @@ sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
 sysctl -qw "net.ipv4.conf.\${TUN_IF}.rp_filter=2" 2>/dev/null || true
 iptables -C FORWARD -o "\${TUN_IF}" -j ACCEPT 2>/dev/null || iptables -I FORWARD -o "\${TUN_IF}" -j ACCEPT
 iptables -C FORWARD -i "\${TUN_IF}" -j ACCEPT 2>/dev/null || iptables -I FORWARD -i "\${TUN_IF}" -j ACCEPT
+# Маркировка HTTPS/QUIC от VPN-клиентов: по метке трафик уходит в таблицу \${RT_TABLE}
+for _proto in tcp udp; do
+  iptables -t mangle -C PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}" 2>/dev/null || \\
+    iptables -t mangle -A PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}"
+done
 EOF
 chmod +x "${ROUTE_UP}"
 
@@ -277,7 +281,10 @@ if ! systemctl is-active --quiet sing-box; then
   exit 1
 fi
 
-command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null || true
+# netfilter-persistent здесь намеренно НЕ вызывается: правила ставит хелпер при
+# старте службы. Сохранённая копия /etc/iptables/rules.v4 захватила бы правила
+# Docker и после перезагрузки накатилась бы раньше него — это ломает сеть
+# контейнеров, а в худшем случае закрывает доступ на сервер.
 
 # --- 9. Проверка --------------------------------------------------------------
 echo

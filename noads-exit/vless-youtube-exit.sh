@@ -289,19 +289,18 @@ mv -f "${NEW_CONF}" "${CONF_DIR}/config.json"
 # Раньше матчили по ipset (наполнял AdGuard); теперь AdGuard не нужен —
 # в tun идёт весь трафик 443 от amn0, а домен смотрит сам sing-box через
 # sniffing (см. выше). Остальные порты (в т.ч. DNS) tun не касаются.
-info "Настраиваю маркировку HTTPS/QUIC-трафика от VPN-клиентов (amn0)..."
 BRIDGE_IF="${BRIDGE_IF:-amn0}"
-for proto in tcp udp; do
-  iptables -t mangle -C PREROUTING -i "${BRIDGE_IF}" -p "${proto}" --dport 443 -j MARK --set-mark "${FWMARK}" 2>/dev/null || \
-    iptables -t mangle -A PREROUTING -i "${BRIDGE_IF}" -p "${proto}" --dport 443 -j MARK --set-mark "${FWMARK}"
-done
 
-# --- 4. Хелпер: поднять маршрут после старта sing-box ------------------------
+# --- 4. Хелпер: маршрут и маркировка после старта sing-box -------------------
+# Правила ставит хелпер, а не этот скрипт: так они возвращаются при каждом
+# старте службы — после перезагрузки, после `iptables -F`, после рестарта
+# Docker. Сохранять их через netfilter-persistent не нужно и вредно.
+info "Готовлю хелпер маршрутизации и маркировки (${BRIDGE_IF} -> ${TUN_IF})..."
 cat > "${ROUTE_UP}" <<EOF
 #!/usr/bin/env bash
 # Ставит policy routing на tun-интерфейс sing-box (вызывается из systemd).
 set -eu
-TUN_IF="${TUN_IF}"; FWMARK="${FWMARK}"; RT_TABLE="${RT_TABLE}"
+TUN_IF="${TUN_IF}"; FWMARK="${FWMARK}"; RT_TABLE="${RT_TABLE}"; BRIDGE_IF="${BRIDGE_IF}"
 for _ in \$(seq 1 60); do
   ip link show "\${TUN_IF}" >/dev/null 2>&1 && break
   sleep 0.25
@@ -313,6 +312,11 @@ sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
 sysctl -qw "net.ipv4.conf.\${TUN_IF}.rp_filter=2" 2>/dev/null || true
 iptables -C FORWARD -o "\${TUN_IF}" -j ACCEPT 2>/dev/null || iptables -I FORWARD -o "\${TUN_IF}" -j ACCEPT
 iptables -C FORWARD -i "\${TUN_IF}" -j ACCEPT 2>/dev/null || iptables -I FORWARD -i "\${TUN_IF}" -j ACCEPT
+# Весь HTTPS/QUIC от VPN-клиентов метим и уводим в tun; домен решает sniffing
+for _proto in tcp udp; do
+  iptables -t mangle -C PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}" 2>/dev/null || \\
+    iptables -t mangle -A PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}"
+done
 EOF
 chmod +x "${ROUTE_UP}"
 
@@ -343,7 +347,7 @@ if ! systemctl is-active --quiet sing-box; then
   exit 1
 fi
 
-command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null || true
+# netfilter-persistent намеренно не вызывается — см. комментарий у хелпера.
 
 echo
 echo "${BLD}Готово.${RST} Домены ютуба уходят через прокси, остальной HTTPS — напрямую."
