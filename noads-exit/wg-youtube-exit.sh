@@ -260,11 +260,17 @@ sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
 sysctl -qw "net.ipv4.conf.\${TUN_IF}.rp_filter=2" 2>/dev/null || true
 iptables -C FORWARD -o "\${TUN_IF}" -j ACCEPT 2>/dev/null || iptables -I FORWARD -o "\${TUN_IF}" -j ACCEPT
 iptables -C FORWARD -i "\${TUN_IF}" -j ACCEPT 2>/dev/null || iptables -I FORWARD -i "\${TUN_IF}" -j ACCEPT
-# Маркировка HTTPS/QUIC от VPN-клиентов: по метке трафик уходит в таблицу \${RT_TABLE}
-for _proto in tcp udp; do
-  iptables -t mangle -C PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}" 2>/dev/null || \\
-    iptables -t mangle -A PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}"
-done
+# Маркировка HTTPS/QUIC от VPN-клиентов: по метке трафик уходит в таблицу \${RT_TABLE}.
+# Моста может не быть вовсе — например, на сервере без Amnezia, где sing-box нужен
+# только под прокси. Тогда маркировать нечего, и это не ошибка.
+if ip link show "\${BRIDGE_IF}" >/dev/null 2>&1; then
+  for _proto in tcp udp; do
+    iptables -t mangle -C PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}" 2>/dev/null || \\
+      iptables -t mangle -A PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}"
+  done
+else
+  echo "Моста \${BRIDGE_IF} нет — маркировку клиентского трафика пропускаю."
+fi
 EOF
 chmod +x "${ROUTE_UP}"
 

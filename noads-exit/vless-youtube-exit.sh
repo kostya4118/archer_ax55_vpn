@@ -318,11 +318,16 @@ sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
 sysctl -qw "net.ipv4.conf.\${TUN_IF}.rp_filter=2" 2>/dev/null || true
 iptables -C FORWARD -o "\${TUN_IF}" -j ACCEPT 2>/dev/null || iptables -I FORWARD -o "\${TUN_IF}" -j ACCEPT
 iptables -C FORWARD -i "\${TUN_IF}" -j ACCEPT 2>/dev/null || iptables -I FORWARD -i "\${TUN_IF}" -j ACCEPT
-# Весь HTTPS/QUIC от VPN-клиентов метим и уводим в tun; домен решает sniffing
-for _proto in tcp udp; do
-  iptables -t mangle -C PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}" 2>/dev/null || \\
-    iptables -t mangle -A PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}"
-done
+# Весь HTTPS/QUIC от VPN-клиентов метим и уводим в tun; домен решает sniffing.
+# Моста может не быть (сервер без Amnezia) — тогда маркировать нечего.
+if ip link show "\${BRIDGE_IF}" >/dev/null 2>&1; then
+  for _proto in tcp udp; do
+    iptables -t mangle -C PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}" 2>/dev/null || \\
+      iptables -t mangle -A PREROUTING -i "\${BRIDGE_IF}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}"
+  done
+else
+  echo "Моста \${BRIDGE_IF} нет — маркировку клиентского трафика пропускаю."
+fi
 EOF
 chmod +x "${ROUTE_UP}"
 
