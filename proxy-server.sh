@@ -279,7 +279,12 @@ else
   echo "  вход  : без пароля"
 fi
 echo
-echo "YouTube через прокси уйдёт в no-ads туннель автоматически —"
-echo "отдельная маркировка не нужна, sing-box решает по SNI."
+if grep -qi 'youtube' "${CONF}"; then
+  echo "YouTube через прокси уйдёт в no-ads туннель автоматически —"
+  echo "отдельная маркировка не нужна, sing-box решает по SNI."
+else
+  echo "Весь трафик прокси идёт напрямую: на этом сервере no-ads туннель не настроен."
+  echo "Если он нужен:  sudo bash noads-exit/wg-youtube-exit.sh /путь/к/конфигу.conf"
+fi
 echo
 echo "Выключить:  sudo bash proxy-server.sh --off"
