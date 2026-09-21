@@ -140,24 +140,46 @@ else
   warn "за это хостеры блокируют VPS. Лучше задай --user и --pass."
 fi
 
-# --- Dante: выключаем, его заменяет этот прокси ---------------------------------
-if systemctl list-unit-files 2>/dev/null | grep -q '^danted' \
-   && systemctl is-active --quiet danted 2>/dev/null; then
-  info "Останавливаю danted — порт освобождается под новый прокси."
-  systemctl disable --now danted >/dev/null 2>&1 || warn "Не удалось остановить danted."
-fi
-
 # --- Порт занят кем-то ещё? ------------------------------------------------------
-# Лучше сказать об этом сразу, чем собрать конфиг и получить от службы
-# "bind: address already in use" уже после подмены рабочего файла.
+# Лучше разобраться сразу, чем собрать конфиг и получить "bind: address already
+# in use" уже после подмены рабочего файла. Dante останавливаем — его и заменяем;
+# на любом другом процессе выходим, ничего не трогая.
+port_busy() { ss -tln 2>/dev/null | grep -qE "[.:]${1}[[:space:]]"; }
+
+free_port() {
+  local port="$1" line name pid
+  line="$(ss -tlnp 2>/dev/null | grep -E "[.:]${port}[[:space:]]" | head -1)"
+  [[ -z "${line}" ]] && return 0
+  [[ "${line}" == *sing-box* ]] && return 0   # наш же процесс, рестарт освободит
+
+  name="$(sed -n 's/.*users:((\"\([^\"]*\)\".*/\1/p' <<< "${line}")"
+  pid="$(sed -n 's/.*pid=\([0-9]\+\).*/\1/p' <<< "${line}")"
+
+  if [[ "${name}" != "danted" && "${name}" != "sockd" ]]; then
+    err "Порт ${port} занят процессом '${name:-неизвестно}':"
+    echo "    ${line}" >&2
+    err "Останови его или возьми другой порт (--port)."
+    exit 1
+  fi
+
+  # Имя юнита у Dante разнится между сборками, а иногда он и вовсе запущен мимо
+  # systemd — поэтому сначала пробуем все варианты, потом просто гасим процесс.
+  info "Порт ${port} держит ${name} — останавливаю, его и заменяем."
+  for unit in danted sockd dante-server; do
+    systemctl disable --now "${unit}" >/dev/null 2>&1 || true
+  done
+  sleep 1
+  if port_busy "${port}" && [[ -n "${pid}" ]]; then
+    warn "Служба не остановилась — завершаю процесс ${pid}."
+    kill "${pid}" 2>/dev/null || true
+    sleep 2
+  fi
+  port_busy "${port}" && { err "Порт ${port} всё ещё занят. Разберись вручную:  ss -tlnp | grep ${port}"; exit 1; }
+  return 0
+}
+
 for _p in "${PORT}" ${SOCKS_PORT:+${SOCKS_PORT}}; do
-  _line="$(ss -tlnp 2>/dev/null | awk -v pat=":${_p}\$" '$4 ~ pat {print; exit}')"
-  [[ -z "${_line}" ]] && continue
-  [[ "${_line}" == *sing-box* ]] && continue   # наш же процесс, рестарт освободит
-  err "Порт ${_p} уже занят другим процессом:"
-  echo "    ${_line}" >&2
-  err "Останови его или возьми другой порт (--port)."
-  exit 1
+  free_port "${_p}"
 done
 
 # --- Собираем фрагмент ----------------------------------------------------------
