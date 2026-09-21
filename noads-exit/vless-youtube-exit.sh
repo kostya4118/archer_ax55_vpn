@@ -305,6 +305,12 @@ for _ in \$(seq 1 60); do
   ip link show "\${TUN_IF}" >/dev/null 2>&1 && break
   sleep 0.25
 done
+# Интерфейса нет — роутинг отключён, а drop-in остался. Выходим с успехом,
+# иначе ExecStartPost уронит службу целиком.
+if ! ip link show "\${TUN_IF}" >/dev/null 2>&1; then
+  echo "Интерфейса \${TUN_IF} нет — маршрутизацию пропускаю."
+  exit 0
+fi
 ip rule show | grep -q "fwmark \${FWMARK} lookup \${RT_TABLE}" || \\
   ip rule add fwmark "\${FWMARK}" table "\${RT_TABLE}"
 ip route replace default dev "\${TUN_IF}" table "\${RT_TABLE}"

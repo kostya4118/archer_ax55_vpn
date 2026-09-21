@@ -147,6 +147,19 @@ if systemctl list-unit-files 2>/dev/null | grep -q '^danted' \
   systemctl disable --now danted >/dev/null 2>&1 || warn "Не удалось остановить danted."
 fi
 
+# --- Порт занят кем-то ещё? ------------------------------------------------------
+# Лучше сказать об этом сразу, чем собрать конфиг и получить от службы
+# "bind: address already in use" уже после подмены рабочего файла.
+for _p in "${PORT}" ${SOCKS_PORT:+${SOCKS_PORT}}; do
+  _line="$(ss -tlnp 2>/dev/null | awk -v pat=":${_p}\$" '$4 ~ pat {print; exit}')"
+  [[ -z "${_line}" ]] && continue
+  [[ "${_line}" == *sing-box* ]] && continue   # наш же процесс, рестарт освободит
+  err "Порт ${_p} уже занят другим процессом:"
+  echo "    ${_line}" >&2
+  err "Останови его или возьми другой порт (--port)."
+  exit 1
+done
+
 # --- Собираем фрагмент ----------------------------------------------------------
 info "Настраиваю прокси (${TYPE})..."
 umask 077
@@ -195,6 +208,18 @@ if ! sing-box check -c "${NEW_CONF}"; then
   exit 1
 fi
 mv -f "${NEW_CONF}" "${CONF}"
+
+# --- Осиротевший хелпер маршрутизации --------------------------------------------
+# Если на сервере когда-то был YouTube-роутинг, а потом его отключили, drop-in с
+# ExecStartPost мог остаться. Хелпер не найдёт tun-интерфейс, вернёт ошибку — и
+# systemd повалит всю службу, хотя сам прокси при этом полностью исправен.
+DROPIN="/etc/systemd/system/sing-box.service.d/noads-route.conf"
+if [[ -f "${DROPIN}" ]] && ! grep -q '"type"[[:space:]]*:[[:space:]]*"tun"' "${CONF}"; then
+  warn "В конфиге нет tun-инбаунда — убираю оставшийся хелпер маршрутизации."
+  rm -f "${DROPIN}"
+  rmdir /etc/systemd/system/sing-box.service.d 2>/dev/null || true
+  systemctl daemon-reload
+fi
 
 systemctl restart sing-box
 sleep 2
