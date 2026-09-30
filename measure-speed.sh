@@ -43,25 +43,34 @@ measure() {
 # --- Текущий поток ----------------------------------------------------------------
 hdr "Что идёт прямо сейчас"
 echo "  (замер за 3 секунды)"
+# Счётчики берём из /sys, а не из /proc/net/dev: там колонки разъезжаются, как
+# только счётчик дорастает до ширины поля, и имя интерфейса слипается с числом.
+counters() {
+  local dev
+  for dev in /sys/class/net/*; do
+    [[ -e "${dev}/statistics/rx_bytes" ]] || continue
+    echo "$(basename "${dev}") $(<"${dev}/statistics/rx_bytes") $(<"${dev}/statistics/tx_bytes")"
+  done
+}
+
 declare -A RX0 TX0
 while read -r iface rx tx; do
   RX0["${iface}"]="${rx}"; TX0["${iface}"]="${tx}"
-done < <(awk -F'[: ]+' 'NR>2 {gsub(/ /,"",$2); print $2, $3, $11}' /proc/net/dev)
+done < <(counters)
 
 sleep 3
 
-printf "  %-12s %14s %12s\n" "интерфейс" "приём" "отдача"
+printf "  %-12s %14s %14s\n" "интерфейс" "приём" "отдача"
 while read -r iface rx tx; do
   [[ "${iface}" == "lo" ]] && continue
-  local_rx0="${RX0[${iface}]:-0}"; local_tx0="${TX0[${iface}]:-0}"
-  d_rx=$(( (rx - local_rx0) * 8 / 3 ))
-  d_tx=$(( (tx - local_tx0) * 8 / 3 ))
+  d_rx=$(( (rx - ${RX0[${iface}]:-0}) * 8 / 3 ))
+  d_tx=$(( (tx - ${TX0[${iface}]:-0}) * 8 / 3 ))
   # Молчащие интерфейсы не показываем, чтобы не загромождать вывод
   (( d_rx < 8000 && d_tx < 8000 )) && continue
-  printf "  %-12s %9.2f Мбит %7.2f Мбит\n" "${iface}" \
+  printf "  %-12s %9.2f Мбит %9.2f Мбит\n" "${iface}" \
     "$(awk -v v="${d_rx}" 'BEGIN{print v/1000000}')" \
     "$(awk -v v="${d_tx}" 'BEGIN{print v/1000000}')"
-done < <(awk -F'[: ]+' 'NR>2 {gsub(/ /,"",$2); print $2, $3, $11}' /proc/net/dev)
+done < <(counters)
 
 [[ "${LIVE_ONLY}" == "1" ]] && exit 0
 
@@ -96,7 +105,9 @@ done
 
 # --- Со стороны клиента -----------------------------------------------------------
 SRV_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')"
-PROXY_PORT="$(ss -tlnp 2>/dev/null | awk '/sing-box/ && /0\.0\.0\.0:/ {split($4,a,":"); print a[2]; exit}')"
+# Порт прокси ищем среди тех, что sing-box слушает на всех адресах: у него есть и
+# внутренние слушатели на адресе tun-интерфейса, они клиентам недоступны.
+PROXY_PORT="$(ss -tlnp 2>/dev/null | awk '/sing-box/ && $4 ~ /^0\.0\.0\.0:/ {split($4,a,":"); print a[2]; exit}')"
 
 hdr "Проверить со своей машины"
 echo "  Через прокси (то, что реально получают клиенты):"
