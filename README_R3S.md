@@ -2099,6 +2099,76 @@ Cloudflare отвечает. На обфусцированных мостах в
 чем давал в тот момент прямой туннель AmneziaWG до сервера с каналом в 585
 Мбит. Это характеристика не Tor, а испорченного маршрута до того хостера.
 
+### Секция Podkop через Tor
+
+Tor виден изнутри роутера как обычный SOCKS5, значит его можно подключить
+к Podkop тем же способом, что и любой прокси, — секцией с
+`proxy_string='socks5://127.0.0.1:9050'`. Удобно сделать её копией `backup`:
+те же списки доменов, другой выход.
+
+```bash
+uci set podkop.tor=section
+uci set podkop.tor.connection_type='proxy'
+uci set podkop.tor.proxy_config_type='url'
+uci set podkop.tor.proxy_string='socks5://127.0.0.1:9050'
+uci set podkop.tor.user_domain_list_type='disabled'
+uci set podkop.tor.user_subnet_list_type='disabled'
+for l in $(uci -q get podkop.backup.community_lists); do
+    uci add_list podkop.tor.community_lists="$l"
+done
+uci commit podkop
+/etc/init.d/podkop restart
+```
+
+Секция создаётся последней и в таком виде ничего не делает: порядок секций —
+это приоритет, срабатывает первая подходящая, а выше уже стоят `youtube`,
+`main` и `backup`. Tor включается подъёмом секции наверх и выключается
+опусканием вниз — два скрипта, `/root/tor-on` и `/root/tor-off`:
+
+```sh
+#!/bin/sh
+# /root/tor-on
+curl -s -m 20 --socks5-hostname 127.0.0.1:9050 \
+    https://check.torproject.org/api/ip | grep -q '"IsTor":true' || {
+    echo "Tor не отвечает, секцию не поднимаю"; exit 1; }
+uci reorder podkop.tor=1
+uci commit podkop
+/etc/init.d/podkop restart
+logger -t tor-switch "секция tor поднята наверх"
+/root/tg-send "трафик пошёл через Tor"
+```
+
+```sh
+#!/bin/sh
+# /root/tor-off
+N="$(uci show podkop | grep -cE '=section|=settings')"
+uci reorder podkop.tor="$N"
+uci commit podkop
+/etc/init.d/podkop restart
+logger -t tor-switch "секция tor опущена вниз"
+/root/tg-send "Tor выключен, вернулись на обычные каналы"
+```
+
+Проверка перед включением не формальность: если Tor лежит (мосты протухли,
+служба не стартовала), поднятая наверх секция утянет в никуда все тринадцать
+списков, то есть почти весь нужный трафик. Поэтому `tor-on` сначала стучится
+через сам SOCKS и отказывается работать, пока не получит `"IsTor":true`.
+
+`N` считается заново при каждом вызове, а не запоминается: `uci reorder`
+нумерует все секции файла, включая `settings`, и число меняется, стоит
+добавить ещё одну секцию.
+
+Из Telegram это вызывается уже существующей командой: `/sh /root/tor-on`,
+`/sh /root/tor-off`. Отдельные пункты в белом списке бота не нужны.
+
+Что трафик действительно идёт через Tor, видно с клиента в сети — открыть
+`check.torproject.org` или сравнить адрес на `ipinfo.io/ip` до и после. На
+роутере то же показывает список соединений Clash:
+
+```bash
+curl -s http://192.168.1.1:9090/connections | jq -r '.connections[].chains[-1]' | sort -u
+```
+
 ---
 
 ## Что осталось за рамками
