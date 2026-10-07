@@ -13,7 +13,9 @@ set -uo pipefail
 
 SIZE_MB=50
 LIVE_ONLY=0
+URL_OVERRIDE=""
 WG_IF="${WG_IF:-wgru}"
+MEASURE_MBIT=""; MEASURE_NOTE=""
 
 GRN=$'\e[32m'; YLW=$'\e[33m'; BLD=$'\e[1m'; RST=$'\e[0m'
 hdr()  { echo; echo "${BLD}$*${RST}"; printf '%s\n' "------------------------------------------------------------"; }
@@ -22,22 +24,33 @@ warn() { echo "  ${YLW}!${RST} $*"; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --size) SIZE_MB="${2:-50}"; shift 2 ;;
+    --url)  URL_OVERRIDE="${2:-}"; shift 2 ;;
     --live) LIVE_ONLY=1; shift ;;
     *) echo "Неизвестный аргумент: $1"; exit 1 ;;
   esac
 done
 
 BYTES=$(( SIZE_MB * 1000000 ))
-URL="https://speed.cloudflare.com/__down?bytes=${BYTES}"
+URL="${URL_OVERRIDE:-https://speed.cloudflare.com/__down?bytes=${BYTES}}"
 
 # Скачивает и возвращает скорость в Мбит/с. $1 — интерфейс или пусто (напрямую).
+# Результат пишем в MEASURE_MBIT, причину неудачи — в MEASURE_NOTE: нули без
+# объяснения выглядят как медленный канал, хотя файл мог просто не скачаться.
 measure() {
-  local iface="${1:-}" args=() bps
-  args=(-s -o /dev/null -w '%{speed_download}' --max-time 120)
+  local iface="${1:-}" args=() out rc bps code size
+  args=(-s -o /dev/null -w '%{speed_download} %{http_code} %{size_download}' --max-time 120)
   [[ -n "${iface}" ]] && args+=(--interface "${iface}")
-  bps="$(curl "${args[@]}" "${URL}" 2>/dev/null || echo 0)"
-  # curl отдаёт байты в секунду, иногда с дробной частью
-  awk -v b="${bps}" 'BEGIN { printf "%.1f", b * 8 / 1000000 }'
+  out="$(curl "${args[@]}" "${URL}" 2>/dev/null)"; rc=$?
+  read -r bps code size <<< "${out:-0 000 0}"
+  MEASURE_NOTE=""
+  if [[ "${rc}" -ne 0 ]]; then
+    MEASURE_NOTE="curl завершился с кодом ${rc}"
+  elif [[ "${code}" != "200" ]]; then
+    MEASURE_NOTE="сервер ответил ${code}"
+  elif [[ "${size:-0}" -lt $(( BYTES / 2 )) ]]; then
+    MEASURE_NOTE="скачалось всего ${size} байт из ${BYTES} — замер недостоверен"
+  fi
+  MEASURE_MBIT="$(awk -v b="${bps:-0}" 'BEGIN { printf "%.1f", b * 8 / 1000000 }')"
 }
 
 # --- Текущий поток ----------------------------------------------------------------
@@ -78,13 +91,21 @@ done < <(counters)
 hdr "Скорость загрузки (${SIZE_MB} МБ с Cloudflare)"
 
 echo -n "  напрямую через интернет : "
-DIRECT="$(measure)"
+measure; DIRECT="${MEASURE_MBIT}"
 echo "${DIRECT} Мбит/с"
+[[ -n "${MEASURE_NOTE}" ]] && warn "${MEASURE_NOTE}"
+
+if [[ -n "${MEASURE_NOTE}" ]]; then
+  warn "Прямой замер не удался, сравнивать не с чем."
+  warn "Проверь источник вручную:  curl -sS -o /dev/null -w '%{http_code}\\n' '${URL}'"
+  warn "Другой источник можно задать:  --url https://пример/файл"
+fi
 
 if ip link show "${WG_IF}" >/dev/null 2>&1; then
   echo -n "  через туннель ${WG_IF}      : "
-  TUNNEL="$(measure "${WG_IF}")"
+  measure "${WG_IF}"; TUNNEL="${MEASURE_MBIT}"
   echo "${TUNNEL} Мбит/с"
+  [[ -n "${MEASURE_NOTE}" ]] && warn "${MEASURE_NOTE}"
 
   # Туннель всегда медленнее прямого канала; вопрос только насколько
   if awk -v d="${DIRECT}" -v t="${TUNNEL}" 'BEGIN { exit !(d > 0 && t < d * 0.3) }'; then
