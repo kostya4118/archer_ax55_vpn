@@ -135,7 +135,18 @@ else
 fi
 
 if ip link show "${WG_IF}" >/dev/null 2>&1; then
-  HS="$(wg show "${WG_IF}" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
+  # Интерфейс мог быть создан обычным WireGuard или AmneziaWG — утилиты разные
+  # и чужой интерфейс не видят. Берём ту, которая про него знает.
+  WGCMD=""
+  for _c in wg awg; do
+    command -v "${_c}" >/dev/null 2>&1 || continue
+    "${_c}" show "${WG_IF}" >/dev/null 2>&1 && { WGCMD="${_c}"; break; }
+  done
+  if [[ -z "${WGCMD}" ]]; then
+    warn "ни wg, ни awg не видят ${WG_IF} — состояние туннеля не проверить"
+    WGCMD="true"
+  fi
+  HS="$(${WGCMD} show "${WG_IF}" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)"
   NOW="$(date +%s)"
   if [[ -n "${HS}" && "${HS}" != "0" ]]; then
     AGE=$(( NOW - HS ))
