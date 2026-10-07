@@ -27,6 +27,18 @@ DBS=()    # базы; --db можно указать несколько раз
 # postgres не может зайти в /root и сыплет предупреждениями — работаем из /tmp
 pg() { (cd /tmp && sudo -u postgres "$@"); }
 
+# systemctl list-unit-files показывает не всё: отключённый или нестандартно
+# установленный юнит в выдачу может не попасть, а systemctl cat находит его всегда
+service_exists() {
+  systemctl cat "$1" >/dev/null 2>&1 && return 0
+  local f
+  for f in "/etc/systemd/system/$1.service" "/lib/systemd/system/$1.service" \
+           "/usr/lib/systemd/system/$1.service"; do
+    [[ -f "${f}" ]] && return 0
+  done
+  return 1
+}
+
 RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLD=$'\e[1m'; RST=$'\e[0m'
 info() { echo "${GRN}[+]${RST} $*"; }
 warn() { echo "${YLW}[!]${RST} $*"; }
@@ -131,8 +143,8 @@ if [[ "${REMOVE}" == "0" ]]; then
   fi
 
   if [[ -n "${SERVICE}" ]]; then
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE}"; then
-      echo "  служба: ${SERVICE} ($(systemctl is-active "${SERVICE}" 2>/dev/null))"
+    if service_exists "${SERVICE}"; then
+      echo "  служба: ${SERVICE} ($(systemctl is-active "${SERVICE}" 2>/dev/null || true), $(systemctl is-enabled "${SERVICE}" 2>/dev/null || true))"
     else
       warn "служба ${SERVICE} не найдена"
       SERVICE=""
@@ -193,9 +205,27 @@ if [[ "${REMOVE}" == "0" ]]; then
 
   for _db in ${DBS+"${DBS[@]}"}; do
     info "Выгружаю базу ${_db} (это может занять время)..."
-    pg pg_dump -Fc "${_db}" > "${STAGE}/db/${_db}.dump" 2>/dev/null || {
-      err "pg_dump не справился с ${_db} — архив не собран, ничего не удалено"; exit 1; }
-    info "база ${_db} выгружена ($(du -sh "${STAGE}/db/${_db}.dump" | cut -f1))"
+    DUMP_ERR="${WORK}/${_db}.stderr"
+    # Ошибки pg_dump НЕ прячем: молчаливо усечённый дамп — худшее, что может
+    # случиться с архивом, который делают перед удалением
+    if ! pg pg_dump -Fc "${_db}" > "${STAGE}/db/${_db}.dump" 2>"${DUMP_ERR}"; then
+      err "pg_dump не справился с ${_db} — архив не собран, ничего не удалено:"
+      sed 's/^/    /' "${DUMP_ERR}" >&2
+      exit 1
+    fi
+    [[ -s "${DUMP_ERR}" ]] && { warn "pg_dump что-то сообщил по ${_db}:"; sed 's/^/    /' "${DUMP_ERR}"; }
+
+    # Сверяем дамп с базой по числу строк: размер файла обманчив, потому что
+    # объём базы складывается в основном из индексов и неубранного мусора
+    ROWS_DB="$(pg psql -tAd "${_db}" -c \
+      "SELECT COALESCE(SUM(n_live_tup),0) FROM pg_stat_user_tables" 2>/dev/null || echo '?')"
+    TABLES_DUMP="$(pg_restore -l "${STAGE}/db/${_db}.dump" 2>/dev/null | grep -c 'TABLE DATA' || true)"
+    info "база ${_db}: $(du -sh "${STAGE}/db/${_db}.dump" | cut -f1), таблиц с данными ${TABLES_DUMP}, строк в базе ${ROWS_DB}"
+    if [[ "${ROWS_DB}" =~ ^[0-9]+$ && "${ROWS_DB}" -gt 0 && "${TABLES_DUMP}" -eq 0 ]]; then
+      err "В базе есть строки, но в дампе нет ни одной таблицы с данными."
+      err "Архив негодный — ничего не удаляй."
+      exit 1
+    fi
   done
 
   if [[ -n "${APP_DIR}" ]]; then
@@ -302,7 +332,7 @@ fi
 
 hdr "Удаляю"
 
-if [[ -n "${SERVICE}" ]] && systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE}"; then
+if [[ -n "${SERVICE}" ]] && service_exists "${SERVICE}"; then
   systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${SERVICE}.service"
   rm -rf "/etc/systemd/system/${SERVICE}.service.d"
