@@ -84,7 +84,14 @@ if [[ -n "${PORT_LINE}" ]]; then
 fi
 
 VHOST="/etc/nginx/sites-available/${DOMAIN}"
-[[ -e "${VHOST}" ]] && { err "Конфиг ${VHOST} уже существует — убери его или возьми другое имя."; exit 1; }
+MARKER="setup-origin.sh"
+# Свой же конфиг переписываем молча: после неудачного запуска он остаётся на
+# диске, и повтор команды не должен упираться в им же созданный файл.
+if [[ -e "${VHOST}" ]] && ! grep -q "${MARKER}" "${VHOST}" 2>/dev/null; then
+  err "Конфиг ${VHOST} уже существует и создан не этим скриптом."
+  err "Убери его сам или возьми другое имя домена."
+  exit 1
+fi
 
 # --- 1. Сайт-заглушка ------------------------------------------------------------
 WEBROOT="/var/www/${DOMAIN}"
@@ -120,6 +127,7 @@ fi
 # Сертификата ещё нет, поэтому ssl-блок писать нельзя: nginx не стартует без файла.
 info "Готовлю временный хост для проверки домена..."
 cat > "${VHOST}" <<EOF
+# Временный хост для проверки домена. Создан setup-origin.sh.
 server {
     listen 80;
     listen [::]:80;
@@ -161,6 +169,19 @@ else
 fi
 
 # --- 4. Боевой конфиг --------------------------------------------------------------
+# Отдельная директива "http2 on;" появилась в nginx 1.25.1. До неё http2
+# включали параметром listen, и старый nginx падает на новом синтаксисе.
+NGINX_VER="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo 0.0.0)"
+if [[ "$(printf '%s\n1.25.1\n' "${NGINX_VER}" | sort -V | head -1)" == "1.25.1" ]]; then
+  LISTEN_443="listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;"
+else
+  LISTEN_443="listen 443 ssl http2;
+    listen [::]:443 ssl http2;"
+fi
+info "nginx ${NGINX_VER} — выбираю подходящий синтаксис http2."
+
 info "Пишу рабочий виртуальный хост..."
 cat > "${VHOST}" <<EOF
 # Сервер-источник для VLESS/XHTTP за CDN. Создан setup-origin.sh.
@@ -183,9 +204,7 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    ${LISTEN_443}
     server_name ${DOMAIN};
 
     ssl_certificate     ${CERT_DIR}/fullchain.pem;
