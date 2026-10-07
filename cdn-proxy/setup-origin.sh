@@ -93,6 +93,16 @@ if [[ -e "${VHOST}" ]] && ! grep -q "${MARKER}" "${VHOST}" 2>/dev/null; then
   exit 1
 fi
 
+# --- 0. Формат лога для диагностики ----------------------------------------------
+# $request_length — весь входящий запрос целиком, вместе с телом. По нему видно,
+# доезжает ли полезная нагрузка: через CDN тело GET-запросов часто вырезают, и
+# тогда запросы приходят короткими, хотя код ответа остаётся 200.
+# log_format разрешён только в http{}, поэтому кладём отдельным файлом в conf.d.
+cat > /etc/nginx/conf.d/xhttp-log-format.conf <<'EOF'
+log_format xhttp '$remote_addr $request_method $uri '
+                 'status=$status req=$request_length sent=$body_bytes_sent t=$request_time';
+EOF
+
 # --- 1. Сайт-заглушка ------------------------------------------------------------
 WEBROOT="/var/www/${DOMAIN}"
 mkdir -p "${WEBROOT}"
@@ -245,7 +255,7 @@ server {
         add_header X-Accel-Buffering no always;
         add_header Cache-Control "no-store, no-transform" always;
 
-        access_log /var/log/nginx/xhttp_access.log;
+        access_log /var/log/nginx/xhttp_access.log xhttp;
     }
 
     location / {
