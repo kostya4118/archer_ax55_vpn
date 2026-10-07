@@ -3,6 +3,10 @@
 # wg-youtube-exit.sh — пустить YouTube-трафик через готовый WireGuard-сервер
 # (например, в России) вместо VLESS/Shadowsocks-прокси.
 #
+# Понимает и обычный WireGuard, и AmneziaWG: формат определяется по наличию
+# параметров обфускации в [Interface], и дальше используется либо wg-quick,
+# либо awg-quick со своим каталогом конфигов.
+#
 # Идея: WireGuard — полноценный сетевой интерфейс, поэтому схема проще, чем с
 # VLESS:
 #   1. Поднимаем WG-конфиг как интерфейс wgru, но с "Table = off" — он НЕ
@@ -23,6 +27,10 @@
 #
 # Запуск:
 #   sudo bash wg-youtube-exit.sh /root/russia.conf
+#
+# Имя интерфейса можно задать, чтобы прежний выход остался нетронутым и откат
+# был мгновенным:
+#   sudo WG_IF=awgmsk bash wg-youtube-exit.sh /root/moscow.conf
 #
 set -euo pipefail
 
@@ -52,21 +60,53 @@ fi
 [[ -f "${SRC_CONF}" ]] || { err "Файл не найден: ${SRC_CONF}"; exit 1; }
 grep -q '^\[Interface\]' "${SRC_CONF}" || { err "Это не похоже на WireGuard-конфиг (нет [Interface])."; exit 1; }
 
-# --- 1. Ставим wireguard, если нужно -----------------------------------------
-if ! command -v wg-quick >/dev/null 2>&1; then
-  info "Устанавливаю wireguard..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq && apt-get install -y -qq wireguard >/dev/null
+# --- 0. Обычный WireGuard или AmneziaWG? --------------------------------------
+# У AmneziaWG в [Interface] добавлены параметры обфускации, которых штатный
+# wg-quick не знает и на которых падает. Определяем по их наличию и дальше
+# пользуемся соответствующим набором утилит.
+AWG_KEYS='Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5|Itime|J1|J2|J3'
+if grep -qiE "^[[:space:]]*(${AWG_KEYS})[[:space:]]*=" "${SRC_CONF}"; then
+  IS_AWG=1
+  QUICK="awg-quick"; WGCMD="awg"; WG_DIR="/etc/amnezia/amneziawg"
+  info "Конфиг в формате AmneziaWG — поднимаю через awg-quick."
+else
+  IS_AWG=0
+  QUICK="wg-quick"; WGCMD="wg"; WG_DIR="/etc/wireguard"
+fi
+
+# --- 1. Ставим нужные утилиты -------------------------------------------------
+if [[ "${IS_AWG}" == "1" ]]; then
+  if ! command -v awg-quick >/dev/null 2>&1; then
+    info "Устанавливаю amneziawg..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -qq software-properties-common >/dev/null 2>&1 || true
+    add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1 || \
+      warn "Не удалось подключить ppa:amnezia/ppa — попробую поставить из того, что есть."
+    apt-get update -qq
+    apt-get install -y -qq amneziawg amneziawg-tools >/dev/null 2>&1 || \
+      apt-get install -y amneziawg amneziawg-tools || true
+  fi
+  command -v awg-quick >/dev/null 2>&1 || {
+    err "awg-quick не установился. Поставь вручную:"
+    err "  add-apt-repository ppa:amnezia/ppa && apt update && apt install amneziawg amneziawg-tools"
+    exit 1
+  }
+else
+  if ! command -v wg-quick >/dev/null 2>&1; then
+    info "Устанавливаю wireguard..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -y -qq wireguard >/dev/null
+  fi
 fi
 
 # --- 2. Готовим конфиг интерфейса --------------------------------------------
-info "Готовлю /etc/wireguard/${WG_IF}.conf ..."
+info "Готовлю ${WG_DIR}/${WG_IF}.conf ..."
 umask 077
-mkdir -p /etc/wireguard
+mkdir -p "${WG_DIR}"
 
 # DNS= убираем: wg-quick иначе перепишет резолвер сервера через resolvconf
 # и положит DNS всем VPN-клиентам. Table=off — чтобы не трогал маршруты.
-# Пишем через временный файл: источником может быть сам /etc/wireguard/<if>.conf,
+# Пишем через временный файл: источником может быть сам конфиг интерфейса,
 # и прямое перенаправление обнулило бы его до того, как awk успеет прочитать.
 TMP_CONF="$(mktemp)"
 awk '
@@ -82,26 +122,26 @@ if ! grep -q '^Table = off' "${TMP_CONF}"; then
   err "(нужна строка [Interface] на отдельной строке)."
   exit 1
 fi
-mv -f "${TMP_CONF}" "/etc/wireguard/${WG_IF}.conf"
+mv -f "${TMP_CONF}" "${WG_DIR}/${WG_IF}.conf"
 
-chmod 600 "/etc/wireguard/${WG_IF}.conf"
+chmod 600 "${WG_DIR}/${WG_IF}.conf"
 
 # --- 3. Поднимаем интерфейс ---------------------------------------------------
 info "Поднимаю интерфейс ${WG_IF}..."
-systemctl enable "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
-systemctl restart "wg-quick@${WG_IF}"
+systemctl enable "${QUICK}@${WG_IF}" >/dev/null 2>&1 || true
+systemctl restart "${QUICK}@${WG_IF}"
 sleep 2
 
 if ! ip link show "${WG_IF}" >/dev/null 2>&1; then
-  err "Интерфейс ${WG_IF} не поднялся. Логи:  journalctl -u wg-quick@${WG_IF} -n 30 --no-pager"
+  err "Интерфейс ${WG_IF} не поднялся. Логи:  journalctl -u ${QUICK}@${WG_IF} -n 30 --no-pager"
   exit 1
 fi
 
 # Проверяем, что handshake вообще случился
-HS="$(wg show "${WG_IF}" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1 || echo 0)"
+HS="$(${WGCMD} show "${WG_IF}" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1 || echo 0)"
 if [[ "${HS:-0}" == "0" ]]; then
   warn "Handshake с WG-сервером пока не состоялся — возможно, нужно пару секунд,"
-  warn "либо сервер недоступен. Проверить:  wg show ${WG_IF}"
+  warn "либо сервер недоступен. Проверить:  ${WGCMD} show ${WG_IF}"
 fi
 
 # --- 3a. Подбираем рабочий MTU ------------------------------------------------
@@ -126,10 +166,10 @@ if [[ "${BEST_PAYLOAD}" -gt 0 ]]; then
   info "Максимум проходит $(( BEST_PAYLOAD + 28 )), ставлю ${SAFE_MTU} (с запасом)."
   ip link set "${WG_IF}" mtu "${SAFE_MTU}" 2>/dev/null || warn "Не удалось применить MTU на лету."
   # Закрепляем в конфиге, чтобы пережило перезапуск
-  if grep -qE '^[[:space:]]*MTU[[:space:]]*=' "/etc/wireguard/${WG_IF}.conf"; then
-    sed -i "s/^[[:space:]]*MTU[[:space:]]*=.*/MTU = ${SAFE_MTU}/" "/etc/wireguard/${WG_IF}.conf"
+  if grep -qE '^[[:space:]]*MTU[[:space:]]*=' "${WG_DIR}/${WG_IF}.conf"; then
+    sed -i "s/^[[:space:]]*MTU[[:space:]]*=.*/MTU = ${SAFE_MTU}/" "${WG_DIR}/${WG_IF}.conf"
   else
-    sed -i "/^\[Interface\]/a MTU = ${SAFE_MTU}" "/etc/wireguard/${WG_IF}.conf"
+    sed -i "/^\[Interface\]/a MTU = ${SAFE_MTU}" "${WG_DIR}/${WG_IF}.conf"
   fi
 else
   warn "Не удалось измерить MTU (ICMP закрыт?) — оставляю как есть."
@@ -306,16 +346,16 @@ EXIT_INFO="$(curl -s --interface "${WG_IF}" --max-time 10 https://ipinfo.io/json
 if [[ -n "${EXIT_INFO}" ]]; then
   echo "${EXIT_INFO}" | grep -E '"(ip|city|country|org)"' || echo "${EXIT_INFO}"
 else
-  warn "Не удалось получить ответ через ${WG_IF} — проверь handshake: wg show ${WG_IF}"
+  warn "Не удалось получить ответ через ${WG_IF} — проверь handshake: ${WGCMD} show ${WG_IF}"
 fi
 
 echo
 echo "${BLD}Готово.${RST} Домены ютуба уходят через WireGuard (${WG_IF}), остальное — напрямую."
 echo
 echo "Проверки:"
-echo "  wg show ${WG_IF}                                  # handshake и трафик"
+echo "  ${WGCMD} show ${WG_IF}                                 # handshake и трафик"
 echo "  curl -s --interface ${WG_IF} https://ipinfo.io    # страна выхода ютуба"
 echo "  journalctl -u sing-box -n 20 --no-pager -l        # ошибки маршрутизации"
 echo
 echo "Выключить перенаправление:"
-echo "  sudo bash noads-exit/disable-youtube-routing.sh && sudo systemctl disable --now wg-quick@${WG_IF}"
+echo "  sudo bash noads-exit/disable-youtube-routing.sh && sudo systemctl disable --now ${QUICK}@${WG_IF}"
