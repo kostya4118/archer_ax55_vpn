@@ -21,6 +21,7 @@ set -euo pipefail
 
 DOMAIN=""; APP_DIR=""; SERVICE=""; DB=""; ARCHIVE=""; OUT_DIR="/root/archives"
 REMOVE=0; ASSUME_YES=0
+KEEP=()   # поддомены, которые остаются жить
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLD=$'\e[1m'; RST=$'\e[0m'
 info() { echo "${GRN}[+]${RST} $*"; }
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --db)      DB="${2:-}"; shift 2 ;;
     --archive) ARCHIVE="${2:-}"; shift 2 ;;
     --out)     OUT_DIR="${2:-}"; shift 2 ;;
+    --keep)    KEEP+=("${2:-}"); shift 2 ;;
     --remove)  REMOVE=1; shift ;;
     --yes)     ASSUME_YES=1; shift ;;
     *) err "Неизвестный аргумент: $1"; exit 1 ;;
@@ -46,20 +48,43 @@ done
 
 [[ -n "${DOMAIN}" ]] || { err "Укажи домен:  --domain example.ru"; exit 1; }
 
-# Конфиги nginx ищем по содержимому, а не по имени файла: вхост может
-# называться как угодно, а домен внутри — это факт.
-find_vhosts() {
-  grep -rlE "server_name[^;]*(^|[[:space:].])${DOMAIN//./\\.}" \
-    /etc/nginx/sites-available/ /etc/nginx/conf.d/ 2>/dev/null || true
+# Остаётся ли это имя жить
+is_kept() {
+  local name="$1" k
+  for k in ${KEEP+"${KEEP[@]}"}; do
+    [[ "${name}" == "${k}" ]] && return 0
+  done
+  return 1
 }
 
-# Сертификаты: и сам домен, и его поддомены
+# Конфиги nginx ищем по содержимому, а не по имени файла: вхост может
+# называться как угодно, а домен внутри — это факт. Файлы, где встречается
+# сохраняемый поддомен, пропускаем целиком: лучше оставить лишнее, чем снести
+# работающий сайт.
+find_vhosts() {
+  local f k
+  while read -r f; do
+    [[ -z "${f}" ]] && continue
+    local skip=0
+    for k in ${KEEP+"${KEEP[@]}"}; do
+      if grep -qE "server_name[^;]*(^|[[:space:].])${k//./\\.}([[:space:];]|$)" "${f}" 2>/dev/null; then
+        skip=1; break
+      fi
+    done
+    [[ "${skip}" == "0" ]] && echo "${f}"
+  done < <(grep -rlE "server_name[^;]*(^|[[:space:].])${DOMAIN//./\\.}" \
+             /etc/nginx/sites-available/ /etc/nginx/conf.d/ 2>/dev/null || true)
+}
+
+# Сертификаты: и сам домен, и его поддомены, кроме сохраняемых
 find_certs() {
-  local d
+  local d name
   for d in /etc/letsencrypt/live/*/; do
     [[ -d "${d}" ]] || continue
-    local name; name="$(basename "${d}")"
-    [[ "${name}" == "${DOMAIN}" || "${name}" == *".${DOMAIN}" ]] && echo "${name}"
+    name="$(basename "${d}")"
+    [[ "${name}" == "${DOMAIN}" || "${name}" == *".${DOMAIN}" ]] || continue
+    is_kept "${name}" && continue
+    echo "${name}"
   done
 }
 
@@ -68,6 +93,11 @@ find_certs() {
 ############################################################################
 if [[ "${REMOVE}" == "0" ]]; then
   hdr "Что относится к ${DOMAIN}"
+
+  if [[ ${#KEEP[@]} -gt 0 ]]; then
+    echo "  ${YLW}остаются нетронутыми:${RST} ${KEEP[*]}"
+    echo
+  fi
 
   VHOSTS="$(find_vhosts)"
   if [[ -n "${VHOSTS}" ]]; then
@@ -302,4 +332,9 @@ fi
 
 hdr "Готово"
 echo "  Архив остался: ${ARCHIVE}"
-echo "  Не забудь снять DNS-записи домена у регистратора."
+if [[ ${#KEEP[@]} -gt 0 ]]; then
+  echo "  Зону ${DOMAIN} у регистратора НЕ удаляй — на ней живёт ${KEEP[*]}."
+  echo "  Снять можно только записи удалённого сайта."
+else
+  echo "  Не забудь снять DNS-записи домена у регистратора."
+fi
