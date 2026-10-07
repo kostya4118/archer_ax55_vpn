@@ -221,14 +221,22 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header Connection "";
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        # X-Forwarded-For намеренно не передаём: Xray его игнорирует, пока не
+        # настроен trustedXForwardedFor, и пишет предупреждение на КАЖДЫЙ запрос.
+        # На потоке из сотен запросов в минуту журнал забивается мгновенно.
 
         # XHTTP — длинные потоковые запросы. Любая буферизация их ломает:
         # данные копятся в nginx вместо того, чтобы идти клиенту.
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_cache off;
+        # gzip работает отдельно от proxy_buffering и копит ответ, чтобы было
+        # что сжимать; postpone_output ждёт заполнения буфера перед отправкой.
+        # На потоке и то, и другое означает, что данные не уходят клиенту.
+        gzip off;
+        tcp_nodelay on;
+        postpone_output 0;
+        chunked_transfer_encoding on;
         proxy_read_timeout 600s;
         proxy_send_timeout 600s;
         proxy_buffer_size 32k;
