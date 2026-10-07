@@ -70,10 +70,17 @@ if [[ "${RESOLVED}" != "${SRV_IP}" ]]; then
 fi
 info "A-запись в порядке: ${DOMAIN} -> ${SRV_IP}"
 
-if ss -tlnp 2>/dev/null | grep -qE "[.:]${XRAY_PORT}[[:space:]]"; then
-  err "Порт ${XRAY_PORT} уже занят — выбери другой через --port."
-  ss -tlnp | grep -E "[.:]${XRAY_PORT}[[:space:]]" | sed 's/^/    /' >&2
-  exit 1
+# Порт должен быть либо свободен, либо занят самим Xray: во втором случае
+# входящее подключение уже создано в панели, и это именно то, чего мы хотим.
+PORT_LINE="$(ss -tlnp 2>/dev/null | grep -E "[.:]${XRAY_PORT}[[:space:]]" | head -1 || true)"
+if [[ -n "${PORT_LINE}" ]]; then
+  if [[ "${PORT_LINE}" == *xray* ]]; then
+    info "На порту ${XRAY_PORT} уже слушает Xray — так и задумано."
+  else
+    err "Порт ${XRAY_PORT} занят посторонним процессом — выбери другой через --port."
+    echo "    ${PORT_LINE}" >&2
+    exit 1
+  fi
 fi
 
 VHOST="/etc/nginx/sites-available/${DOMAIN}"
