@@ -91,6 +91,38 @@ if [[ "${IS_AWG}" == "1" ]]; then
     err "  add-apt-repository ppa:amnezia/ppa && apt update && apt install amneziawg amneziawg-tools"
     exit 1
   }
+
+  # Утилит мало: нужен ещё сам модуль ядра, иначе "ip link add type amneziawg"
+  # отвечает "Unknown device type". DKMS собирает его из исходников, а для этого
+  # нужны заголовки работающего ядра — их на VPS часто нет.
+  if [[ ! -d /sys/module/amneziawg ]] && ! modprobe amneziawg 2>/dev/null; then
+    info "Модуля ядра amneziawg нет — ставлю заголовки и пересобираю..."
+    apt-get install -y -qq "linux-headers-$(uname -r)" >/dev/null 2>&1 || \
+      warn "Заголовки для ядра $(uname -r) не нашлись."
+    apt-get install -y -qq --reinstall amneziawg >/dev/null 2>&1 || true
+    if ! modprobe amneziawg 2>/dev/null; then
+      # Запасной путь: реализация в пространстве пользователя. Работает без
+      # сборки под ядро, стоит немного процессорного времени на пакет.
+      info "Собрать модуль не вышло — ставлю amneziawg-go (работает без модуля)."
+      apt-get install -y -qq amneziawg-go >/dev/null 2>&1 || \
+        apt-get install -y amneziawg-go || true
+      command -v amneziawg-go >/dev/null 2>&1 || {
+        err "Ни модуль ядра, ни amneziawg-go поставить не удалось."
+        err "Посмотри, что говорит сборка:  dkms status; dmesg | tail -20"
+        exit 1
+      }
+      # awg-quick сам возьмёт userspace-реализацию, если указать её явно
+      export WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+      mkdir -p "/etc/systemd/system/awg-quick@${WG_IF}.service.d"
+      cat > "/etc/systemd/system/awg-quick@${WG_IF}.service.d/userspace.conf" <<EOF
+[Service]
+Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+EOF
+      systemctl daemon-reload
+    else
+      info "Модуль ядра amneziawg загружен."
+    fi
+  fi
 else
   if ! command -v wg-quick >/dev/null 2>&1; then
     info "Устанавливаю wireguard..."
