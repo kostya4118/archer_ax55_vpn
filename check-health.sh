@@ -11,9 +11,26 @@ set -uo pipefail   # без -e: проверки должны доходить �
 
 BRIDGE_IF="${BRIDGE_IF:-amn0}"
 TUN_IF="${TUN_IF:-singbox0}"
-WG_IF="${WG_IF:-wgru}"
 FWMARK="${FWMARK:-0x77}"
 RT_TABLE="${RT_TABLE:-200}"
+
+# Имя выходного интерфейса не угадываем, а читаем из конфига sing-box: именно
+# там записано, куда уходят домены YouTube. Иначе скрипт ищет интерфейс со
+# старым именем и жалуется на его отсутствие, когда всё на самом деле работает.
+SB_CONF="/etc/sing-box/config.json"
+if [[ -z "${WG_IF:-}" && -r "${SB_CONF}" ]]; then
+  WG_IF="$(python3 -c "
+import json,sys
+try:
+    c=json.load(open('${SB_CONF}'))
+except Exception:
+    sys.exit()
+for o in c.get('outbounds', []):
+    if o.get('bind_interface'):
+        print(o['bind_interface']); break
+" 2>/dev/null || true)"
+fi
+WG_IF="${WG_IF:-wgru}"
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLD=$'\e[1m'; RST=$'\e[0m'
 ok()   { echo "  ${GRN}✓${RST} $*"; }
