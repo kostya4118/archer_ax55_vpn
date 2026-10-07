@@ -17,9 +17,10 @@ URL_OVERRIDE=""
 WG_IF="${WG_IF:-wgru}"
 MEASURE_MBIT=""; MEASURE_NOTE=""
 
-GRN=$'\e[32m'; YLW=$'\e[33m'; BLD=$'\e[1m'; RST=$'\e[0m'
+RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLD=$'\e[1m'; RST=$'\e[0m'
 hdr()  { echo; echo "${BLD}$*${RST}"; printf '%s\n' "------------------------------------------------------------"; }
 warn() { echo "  ${YLW}!${RST} $*"; }
+err()  { echo "  ${RED}x${RST} $*" >&2; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,7 +32,30 @@ while [[ $# -gt 0 ]]; do
 done
 
 BYTES=$(( SIZE_MB * 1000000 ))
-URL="${URL_OVERRIDE:-https://speed.cloudflare.com/__down?bytes=${BYTES}}"
+
+# Источники пробуем по очереди: публичные файлы то переезжают, то начинают
+# отдавать 403 отдельным сетям, и один жёстко зашитый адрес регулярно подводит.
+CANDIDATES=(
+  "https://speed.cloudflare.com/__down?bytes=${BYTES}"
+  "http://speedtest.selectel.ru/100MB"
+  "http://ipv4.download.thinkbroadband.com/100MB.zip"
+)
+
+pick_url() {
+  local u code
+  for u in "${CANDIDATES[@]}"; do
+    # без "|| echo 000": curl и при неудаче печатает свой %{http_code},
+    # и запасное значение просто склеивалось с ним в "000000"
+    code="$(curl -s -o /dev/null -r 0-1023 -w '%{http_code}' --max-time 15 "${u}" 2>/dev/null)"
+    code="${code:-000}"
+    # 206 — сервер отдал запрошенный кусок, 200 — отдал бы целиком
+    if [[ "${code}" == "200" || "${code}" == "206" ]]; then
+      echo "${u}"; return 0
+    fi
+    echo "  ${YLW}!${RST} ${u} — ответил ${code}, пропускаю" >&2
+  done
+  return 1
+}
 
 # Скачивает и возвращает скорость в Мбит/с. $1 — интерфейс или пусто (напрямую).
 # Результат пишем в MEASURE_MBIT, причину неудачи — в MEASURE_NOTE: нули без
@@ -47,8 +71,8 @@ measure() {
     MEASURE_NOTE="curl завершился с кодом ${rc}"
   elif [[ "${code}" != "200" ]]; then
     MEASURE_NOTE="сервер ответил ${code}"
-  elif [[ "${size:-0}" -lt $(( BYTES / 2 )) ]]; then
-    MEASURE_NOTE="скачалось всего ${size} байт из ${BYTES} — замер недостоверен"
+  elif [[ "${size:-0}" -lt 1000000 ]]; then
+    MEASURE_NOTE="скачалось всего ${size} байт — замер недостоверен"
   fi
   MEASURE_MBIT="$(awk -v b="${bps:-0}" 'BEGIN { printf "%.1f", b * 8 / 1000000 }')"
 }
@@ -88,7 +112,17 @@ done < <(counters)
 [[ "${LIVE_ONLY}" == "1" ]] && exit 0
 
 # --- Замер скорости ---------------------------------------------------------------
-hdr "Скорость загрузки (${SIZE_MB} МБ с Cloudflare)"
+hdr "Скорость загрузки"
+
+if [[ -n "${URL_OVERRIDE}" ]]; then
+  URL="${URL_OVERRIDE}"
+else
+  URL="$(pick_url || true)"
+  [[ -z "${URL}" ]] && { err "Ни один тестовый источник не отвечает."; \
+    err "Задай свой:  --url https://пример/файл"; exit 1; }
+fi
+echo "  источник: ${URL}"
+echo
 
 echo -n "  напрямую через интернет : "
 measure; DIRECT="${MEASURE_MBIT}"
