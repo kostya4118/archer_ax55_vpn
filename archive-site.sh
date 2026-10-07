@@ -19,9 +19,13 @@
 #
 set -euo pipefail
 
-DOMAIN=""; APP_DIR=""; SERVICE=""; DB=""; ARCHIVE=""; OUT_DIR="/root/archives"
+DOMAIN=""; APP_DIR=""; SERVICE=""; ARCHIVE=""; OUT_DIR="/root/archives"
 REMOVE=0; ASSUME_YES=0
 KEEP=()   # поддомены, которые остаются жить
+DBS=()    # базы; --db можно указать несколько раз
+
+# postgres не может зайти в /root и сыплет предупреждениями — работаем из /tmp
+pg() { (cd /tmp && sudo -u postgres "$@"); }
 
 RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; BLD=$'\e[1m'; RST=$'\e[0m'
 info() { echo "${GRN}[+]${RST} $*"; }
@@ -36,7 +40,7 @@ while [[ $# -gt 0 ]]; do
     --domain)  DOMAIN="${2:-}"; shift 2 ;;
     --app-dir) APP_DIR="${2:-}"; shift 2 ;;
     --service) SERVICE="${2:-}"; shift 2 ;;
-    --db)      DB="${2:-}"; shift 2 ;;
+    --db)      DBS+=("${2:-}"); shift 2 ;;
     --archive) ARCHIVE="${2:-}"; shift 2 ;;
     --out)     OUT_DIR="${2:-}"; shift 2 ;;
     --keep)    KEEP+=("${2:-}"); shift 2 ;;
@@ -131,17 +135,19 @@ if [[ "${REMOVE}" == "0" ]]; then
     fi
   fi
 
-  if [[ -n "${DB}" ]]; then
-    if sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw "${DB}"; then
-      SIZE="$(sudo -u postgres psql -tAc "SELECT pg_size_pretty(pg_database_size('${DB}'))" 2>/dev/null || echo '?')"
-      echo "  база: ${DB} (${SIZE})"
-    else
-      err "базы ${DB} в PostgreSQL нет. Список:"
-      sudo -u postgres psql -lqt 2>/dev/null | cut -d'|' -f1 | sed 's/^/    /' | grep -v '^\s*$'
-      exit 1
-    fi
+  if [[ ${#DBS[@]} -gt 0 ]]; then
+    for _db in "${DBS[@]}"; do
+      if pg psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -qw "${_db}"; then
+        SIZE="$(pg psql -tAc "SELECT pg_size_pretty(pg_database_size('${_db}'))" 2>/dev/null || echo '?')"
+        echo "  база: ${_db} (${SIZE})"
+      else
+        err "базы ${_db} в PostgreSQL нет. Список:"
+        pg psql -lqt 2>/dev/null | cut -d'|' -f1 | grep -v '^\s*$' | sed 's/^/    /'
+        exit 1
+      fi
+    done
   else
-    warn "база не указана (--db) — в архив не попадёт"
+    warn "базы не указаны (--db) — в архив не попадут"
   fi
 
   # --- Собираем ---------------------------------------------------------------
@@ -181,12 +187,12 @@ if [[ "${REMOVE}" == "0" ]]; then
     info "сертификаты сохранены"
   fi
 
-  if [[ -n "${DB}" ]]; then
-    info "Выгружаю базу ${DB} (это может занять время)..."
-    sudo -u postgres pg_dump -Fc "${DB}" > "${STAGE}/db/${DB}.dump" 2>/dev/null || {
-      err "pg_dump не справился — архив не собран, ничего не удалено"; exit 1; }
-    info "база выгружена ($(du -sh "${STAGE}/db/${DB}.dump" | cut -f1))"
-  fi
+  for _db in ${DBS+"${DBS[@]}"}; do
+    info "Выгружаю базу ${_db} (это может занять время)..."
+    pg pg_dump -Fc "${_db}" > "${STAGE}/db/${_db}.dump" 2>/dev/null || {
+      err "pg_dump не справился с ${_db} — архив не собран, ничего не удалено"; exit 1; }
+    info "база ${_db} выгружена ($(du -sh "${STAGE}/db/${_db}.dump" | cut -f1))"
+  done
 
   if [[ -n "${APP_DIR}" ]]; then
     info "Копирую код из ${APP_DIR}..."
@@ -208,12 +214,12 @@ if [[ "${REMOVE}" == "0" ]]; then
   nginx/        конфиги виртуальных хостов (+ список включённых на момент архивации)
   systemd/      юнит службы ${SERVICE:-—} и его drop-in'ы
   letsencrypt/  сертификаты и файлы обновления
-  db/           дамп PostgreSQL ${DB:-—}, формат custom (pg_restore)
+  db/           дампы PostgreSQL (${DBS[*]:-—}), формат custom (pg_restore)
   app/          код из ${APP_DIR:-—} без node_modules, venv и кэшей
 
 Как восстановить:
-  база   : sudo -u postgres createdb ${DB:-DBNAME}
-           sudo -u postgres pg_restore -d ${DB:-DBNAME} db/${DB:-DBNAME}.dump
+  база   : sudo -u postgres createdb ИМЯ
+           sudo -u postgres pg_restore -d ИМЯ db/ИМЯ.dump
   код    : скопировать app/ обратно, поставить зависимости заново
   nginx  : вернуть файлы в /etc/nginx/sites-available/, создать симлинки, nginx -t
   служба : вернуть юнит, systemctl daemon-reload, systemctl enable --now
@@ -243,8 +249,10 @@ MEOF
   echo "  tar -tzf ${ARCHIVE_PATH}"
   echo
   echo "${BLD}Скачай и проверь архив, и только потом удаляй:${RST}"
+  DB_ARGS=""; for _db in ${DBS+"${DBS[@]}"}; do DB_ARGS+=" --db ${_db}"; done
+  KEEP_ARGS=""; for _k in ${KEEP+"${KEEP[@]}"}; do KEEP_ARGS+=" --keep ${_k}"; done
   echo "  sudo bash archive-site.sh --remove --archive ${ARCHIVE_PATH} \\"
-  echo "    --domain ${DOMAIN}${APP_DIR:+ --app-dir ${APP_DIR}}${SERVICE:+ --service ${SERVICE}}${DB:+ --db ${DB}}"
+  echo "    --domain ${DOMAIN}${KEEP_ARGS}${APP_DIR:+ --app-dir ${APP_DIR}}${SERVICE:+ --service ${SERVICE}}${DB_ARGS}"
   exit 0
 fi
 
@@ -260,11 +268,11 @@ LIST="$(tar -tzf "${ARCHIVE}")"
 info "архив читается, файлов: $(echo "${LIST}" | wc -l)"
 
 # Сверяем, что в архиве действительно лежит то, что собираемся удалять
-if [[ -n "${DB}" ]]; then
-  echo "${LIST}" | grep -q "db/${DB}.dump" \
-    || { err "В архиве нет дампа базы ${DB} — удаление отменено"; exit 1; }
-  info "дамп базы ${DB} на месте"
-fi
+for _db in ${DBS+"${DBS[@]}"}; do
+  echo "${LIST}" | grep -q "db/${_db}.dump" \
+    || { err "В архиве нет дампа базы ${_db} — удаление отменено"; exit 1; }
+  info "дамп базы ${_db} на месте"
+done
 if [[ -n "${APP_DIR}" ]]; then
   echo "${LIST}" | grep -q "app/$(basename "${APP_DIR}")/" \
     || { err "В архиве нет кода из ${APP_DIR} — удаление отменено"; exit 1; }
@@ -276,7 +284,7 @@ VHOSTS="$(find_vhosts)"
 [[ -n "${VHOSTS}" ]] && { echo "  конфиги nginx:"; echo "${VHOSTS}" | sed 's/^/    /'; }
 [[ -n "${SERVICE}" ]] && echo "  служба: ${SERVICE} (остановлена и отключена)"
 [[ -n "${APP_DIR}" && -d "${APP_DIR}" ]] && echo "  каталог: ${APP_DIR}"
-[[ -n "${DB}" ]] && echo "  база PostgreSQL: ${DB}"
+[[ ${#DBS[@]} -gt 0 ]] && echo "  базы PostgreSQL: ${DBS[*]}"
 CERTS="$(find_certs)"
 [[ -n "${CERTS}" ]] && { echo "  сертификаты:"; echo "${CERTS}" | sed 's/^/    /'; }
 echo
@@ -312,10 +320,10 @@ if [[ -n "${VHOSTS}" ]]; then
   fi
 fi
 
-if [[ -n "${DB}" ]]; then
-  sudo -u postgres dropdb --if-exists "${DB}" && info "база ${DB} удалена" \
-    || warn "не удалось удалить базу ${DB}"
-fi
+for _db in ${DBS+"${DBS[@]}"}; do
+  pg dropdb --if-exists "${_db}" && info "база ${_db} удалена" \
+    || warn "не удалось удалить базу ${_db}"
+done
 
 if [[ -n "${APP_DIR}" && -d "${APP_DIR}" ]]; then
   rm -rf "${APP_DIR}"
