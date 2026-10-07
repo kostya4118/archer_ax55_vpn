@@ -78,6 +78,9 @@ find_vhosts() {
     [[ "${skip}" == "0" ]] && echo "${f}"
   done < <(grep -rlE "server_name[^;]*(^|[[:space:].])${DOMAIN//./\\.}" \
              /etc/nginx/sites-available/ /etc/nginx/conf.d/ 2>/dev/null || true)
+  # Без этого функция возвращает статус последней проверки: если последний файл
+  # оказался сохраняемым, под set -e скрипт молча обрывался прямо здесь.
+  return 0
 }
 
 # Сертификаты: и сам домен, и его поддомены, кроме сохраняемых
@@ -90,6 +93,7 @@ find_certs() {
     is_kept "${name}" && continue
     echo "${name}"
   done
+  return 0
 }
 
 ############################################################################
@@ -161,7 +165,7 @@ if [[ "${REMOVE}" == "0" ]]; then
 
   if [[ -n "${VHOSTS}" ]]; then
     while read -r f; do
-      [[ -n "${f}" ]] && cp -a "${f}" "${STAGE}/nginx/"
+      [[ -n "${f}" ]] && cp -a "${f}" "${STAGE}/nginx/" || true
     done <<< "${VHOSTS}"
     # Какие из них были включены — иначе при восстановлении не угадать
     ls -la /etc/nginx/sites-enabled/ > "${STAGE}/nginx/_sites-enabled.txt" 2>/dev/null || true
@@ -171,7 +175,7 @@ if [[ "${REMOVE}" == "0" ]]; then
   if [[ -n "${SERVICE}" ]]; then
     systemctl cat "${SERVICE}" > "${STAGE}/systemd/${SERVICE}.txt" 2>/dev/null || true
     for p in "/etc/systemd/system/${SERVICE}.service" "/etc/systemd/system/${SERVICE}.service.d"; do
-      [[ -e "${p}" ]] && cp -a "${p}" "${STAGE}/systemd/"
+      [[ -e "${p}" ]] && cp -a "${p}" "${STAGE}/systemd/" || true
     done
     info "юнит ${SERVICE} сохранён"
   fi
@@ -182,7 +186,7 @@ if [[ "${REMOVE}" == "0" ]]; then
       # live — это симлинки в archive, поэтому копируем и то, и другое
       cp -rL "/etc/letsencrypt/live/${c}" "${STAGE}/letsencrypt/${c}" 2>/dev/null || true
       [[ -f "/etc/letsencrypt/renewal/${c}.conf" ]] && \
-        cp -a "/etc/letsencrypt/renewal/${c}.conf" "${STAGE}/letsencrypt/"
+        cp -a "/etc/letsencrypt/renewal/${c}.conf" "${STAGE}/letsencrypt/" || true
     done <<< "${CERTS}"
     info "сертификаты сохранены"
   fi
@@ -281,12 +285,12 @@ fi
 
 hdr "Будет удалено"
 VHOSTS="$(find_vhosts)"
-[[ -n "${VHOSTS}" ]] && { echo "  конфиги nginx:"; echo "${VHOSTS}" | sed 's/^/    /'; }
-[[ -n "${SERVICE}" ]] && echo "  служба: ${SERVICE} (остановлена и отключена)"
-[[ -n "${APP_DIR}" && -d "${APP_DIR}" ]] && echo "  каталог: ${APP_DIR}"
-[[ ${#DBS[@]} -gt 0 ]] && echo "  базы PostgreSQL: ${DBS[*]}"
+[[ -n "${VHOSTS}" ]] && { echo "  конфиги nginx:"; echo "${VHOSTS}" | sed 's/^/    /'; } || true
+[[ -n "${SERVICE}" ]] && echo "  служба: ${SERVICE} (остановлена и отключена)" || true
+[[ -n "${APP_DIR}" && -d "${APP_DIR}" ]] && echo "  каталог: ${APP_DIR}" || true
+[[ ${#DBS[@]} -gt 0 ]] && echo "  базы PostgreSQL: ${DBS[*]}" || true
 CERTS="$(find_certs)"
-[[ -n "${CERTS}" ]] && { echo "  сертификаты:"; echo "${CERTS}" | sed 's/^/    /'; }
+[[ -n "${CERTS}" ]] && { echo "  сертификаты:"; echo "${CERTS}" | sed 's/^/    /'; } || true
 echo
 echo "  ${YLW}Остальные сайты и службы не затрагиваются.${RST}"
 
