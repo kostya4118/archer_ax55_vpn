@@ -77,11 +77,16 @@ fi
 systemctl cat "${UNIT}" >/dev/null 2>&1 || { err "Юнита ${UNIT} нет."; exit 1; }
 systemctl is-active --quiet "${UNIT}" || warn "${UNIT} сейчас не запущен — правило всё равно поставлю."
 
-ip rule show 2>/dev/null | grep -q "fwmark ${FWMARK} lookup" || {
-  err "Нет правила маршрутизации по метке ${FWMARK}."
-  err "Сначала настрой выход:  sudo bash noads-exit/wg-youtube-exit.sh /путь/к/конфигу"
-  exit 1
-}
+# Проверка предупреждающая, а не запрещающая: пометить трафик можно и до того,
+# как поднят туннель, — правило просто начнёт действовать позже. Раньше здесь
+# стоял выход с ошибкой, и он срабатывал даже при живом правиле.
+IP_RULES="$(ip rule show 2>/dev/null || true)"
+if [[ "${IP_RULES}" != *"fwmark ${FWMARK}"* ]]; then
+  warn "Не вижу правила маршрутизации по метке ${FWMARK}. Сейчас в ip rule:"
+  echo "${IP_RULES:-(пусто)}" | sed 's/^/      /'
+  warn "Метку поставлю, но заработает она только когда поднимется выход:"
+  warn "  sudo bash noads-exit/wg-youtube-exit.sh /путь/к/конфигу"
+fi
 
 # Сам sing-box метить нельзя: его трафик вернётся в его же tun-интерфейс
 case "${UNIT}" in
