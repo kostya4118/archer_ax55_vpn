@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+#
+# Выходной узел OpenFlux под procd (OpenWrt).
+#
+# Ставится в /etc/init.d/openflux, настройки читает из /etc/openflux/openflux.env.
+#
+# Запуск узла именно на роутере даёт то, ради чего всё затевалось: соединения
+# наружу открывает сам роутер, поэтому они идут по его обычной таблице
+# маршрутизации — через podkop со всеми его списками. Телефон на мобильном
+# интернете получает ту же маршрутизацию, что и устройства дома.
+#
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/usr/bin/openflux
+CONF=/etc/openflux/openflux.env
+WORKDIR=/etc/openflux
+
+start_service() {
+    [ -x "${PROG}" ] || { echo "openflux: нет ${PROG}"; return 1; }
+    [ -r "${CONF}" ] || { echo "openflux: нет ${CONF}"; return 1; }
+
+    # shellcheck source=/dev/null
+    . "${CONF}"
+
+    [ -n "${URL}" ]     || { echo "openflux: в ${CONF} не задан URL"; return 1; }
+    [ -r "${KEYFILE}" ] || { echo "openflux: нет ключа ${KEYFILE}"; return 1; }
+
+    procd_open_instance openflux
+    # Через sh -c, потому что у procd нет параметра рабочего каталога, а узел
+    # хранит cookie по относительному пути — иначе файл окажется в корне.
+    procd_set_param command /bin/sh -c \
+        "cd '${WORKDIR}' && exec '${PROG}' --role=exit --mode=l4 \
+         --transport='${TRANSPORT:-mailru}' --url='${URL}' \
+         --encryption-key-file='${KEYFILE}' ${EXTRA_ARGS}"
+    # Перезапуск при падении: не чаще 5 секунд, без ограничения числа попыток
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param pidfile /var/run/openflux.pid
+    procd_close_instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger "openflux"
+}
