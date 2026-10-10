@@ -343,6 +343,23 @@ if ip link show "\${BRIDGE_IF}" >/dev/null 2>&1; then
 else
   echo "Моста \${BRIDGE_IF} нет — маркировку клиентского трафика пропускаю."
 fi
+
+# Службы, работающие на самом сервере, ходят в интернет через цепочку OUTPUT, а
+# не через мост клиентов, — и мимо всей схемы. Чтобы и их ютуб уходил в туннель,
+# метим их исходящий трафик по cgroup: так матчится ровно один systemd-юнит и
+# ничей больше. Список юнитов ведёт route-service-output.sh.
+SERVICES_LIST="/etc/noads-routed-services"
+if [ -r "\${SERVICES_LIST}" ]; then
+  while read -r _unit; do
+    case "\${_unit}" in ''|'#'*) continue ;; esac
+    _cg="system.slice/\${_unit}"
+    for _proto in tcp udp; do
+      iptables -t mangle -C OUTPUT -m cgroup --path "\${_cg}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}" 2>/dev/null || \\
+        iptables -t mangle -A OUTPUT -m cgroup --path "\${_cg}" -p "\${_proto}" --dport 443 -j MARK --set-mark "\${FWMARK}" 2>/dev/null || \\
+        echo "Не удалось пометить \${_unit} — пропускаю."
+    done
+  done < "\${SERVICES_LIST}"
+fi
 EOF
 chmod +x "${ROUTE_UP}"
 
