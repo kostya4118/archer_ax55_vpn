@@ -63,8 +63,8 @@ cat /etc/openflux/secret.txt
 
 ```sh
 cat > /etc/openflux/openflux.env <<'EOF'
-TRANSPORT=mailru
-URL=https://cloud.mail.ru/public/ВАША/ССЫЛКА
+TRANSPORT=boards
+URL=https://boards.yandex.ru/whiteboard/?hash=ВАШ_ХЭШ
 KEYFILE=/etc/openflux/secret.txt
 EXTRA_ARGS=
 EOF
@@ -72,17 +72,20 @@ chmod 600 /etc/openflux/openflux.env
 ```
 
 Ссылка на документ входит в вывод ключа шифрования, поэтому в клиенте она
-должна совпадать **символ в символ**.
+должна совпадать **символ в символ**. Сам транспорт досок берёт из неё только
+параметр `hash`, но контекст шифрования считается по всей строке.
 
 ## 4. Запуск
 
 ```sh
 /etc/init.d/openflux enable
 /etc/init.d/openflux start
-logread -f | grep -i openflux
+logread -f | grep -iE "openflux|boards|EXIT NODE"
 ```
 
-В журнале должно появиться `Running as EXIT NODE`.
+В журнале должно появиться `Running as EXIT NODE`, а строкой выше — контекст
+шифрования (`Encryption context: sha256 ...`). Если клиент не собирает туннель
+молча, первым делом сверяй ссылку: другой контекст — другой ключ.
 
 ## Капча у яндексовых транспортов
 
@@ -155,7 +158,7 @@ TestFlight от 7 октября ещё страдала. Значит обно�
 
 ## 5. Клиент
 
-В приложении на телефоне: транспорт Mail.ru, та же ссылка, тот же ключ.
+В приложении на телефоне: транспорт Yandex Boards, та же ссылка, тот же ключ.
 
 Если в логе узла появится `the peer sends classic-mode frames ... this side
 serves Session peers only`, значит сборка клиента старее и не умеет
@@ -178,8 +181,11 @@ serves Session peers only`, значит сборка клиента старе�
 
 ```sh
 /etc/init.d/openflux status
-logread -e openflux | tail -30
+logread | grep -iE "openflux|boards|EXIT NODE" | tail -30
 ```
+
+Фильтровать именно так, а не `logread -e openflux`: имя службы в журнале не
+появляется, procd помечает строки именем запущенного процесса.
 
 `[M-DOCS] connection to the document dropped ... reconnecting` раз в несколько
 минут или часов — нормально, долгоживущий веб-сокет периодически рвётся и
