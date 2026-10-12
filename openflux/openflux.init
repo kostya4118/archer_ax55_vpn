@@ -24,8 +24,14 @@ start_service() {
     # shellcheck source=/dev/null
     . "${CONF}"
 
-    [ -n "${URL}" ]     || { echo "openflux: в ${CONF} не задан URL"; return 1; }
     [ -r "${KEYFILE}" ] || { echo "openflux: нет ключа ${KEYFILE}"; return 1; }
+
+    # Адрес носителя можно держать в отдельном файле. Для cupsonline это
+    # единственный разумный способ: список комнат — строка в сотни символов,
+    # и в командную строку BusyBox она целиком не влезает.
+    if [ -z "${URL}" ] && [ -n "${URL_FILE}" ] && [ -r "${URL_FILE}" ]; then
+        URL="$(cat "${URL_FILE}")"
+    fi
 
     # Один транспорт или список. Список нужен, когда какой-то из них требует
     # капчу: приложение решает её через уже работающий транспорт, а капризный
@@ -34,19 +40,35 @@ start_service() {
     # без разбора оболочкой, и они попали бы в имя транспорта.
     if [ -n "${TRANSPORTS}" ]; then
         TRANSPORT_ARG="--transports=${TRANSPORTS}"
+        FIRST_TRANSPORT="${TRANSPORTS%%[:,]*}"
     else
-        TRANSPORT_ARG="--transport=${TRANSPORT:-boards}"
+        TRANSPORT_ARG="--transport=${TRANSPORT:-cupsonline}"
+        FIRST_TRANSPORT="${TRANSPORT:-cupsonline}"
     fi
+
+    # cupsonline умеет стартовать без адреса: тогда узел сам создаёт комнаты и
+    # печатает их список (см. README — его нужно сохранить в URL_FILE и отдать
+    # клиенту). Остальным транспортам адрес обязателен.
+    if [ -z "${URL}" ] && [ "${FIRST_TRANSPORT}" != "cupsonline" ]; then
+        echo "openflux: в ${CONF} не задан ни URL, ни читаемый URL_FILE"
+        return 1
+    fi
+
+    # Режим l3 быстрее, но на роутере он ломает передачу — пакеты перестают
+    # ходить вовсе, видимо из-за podkop и правил межсетевого экрана. Поэтому
+    # по умолчанию l4; менять осознанно через MODE= в настройках.
+    set -- --role=exit --mode="${MODE:-l4}" ${TRANSPORT_ARG} \
+        --encryption-key-file="${KEYFILE}" \
+        --cookie-store="${WORKDIR}/cookies.json"
+    [ -n "${URL}" ] && set -- "$@" --url="${URL}"
+    [ -n "${EXTRA_ARGS}" ] && set -- "$@" ${EXTRA_ARGS}
 
     procd_open_instance openflux
     # Рабочий каталог procd не задаёт, а узел по умолчанию кладёт cookie по
     # относительному пути — то есть в корень. Поэтому путь к ним задаём явно и
     # запускаем бинарник напрямую: через /bin/sh -c весь вывод уходил в журнал
     # под тегом sh, и `logread -e openflux` ничего не находил.
-    procd_set_param command "${PROG}" --role=exit --mode=l4 \
-        ${TRANSPORT_ARG} --url="${URL}" \
-        --encryption-key-file="${KEYFILE}" \
-        --cookie-store="${WORKDIR}/cookies.json" ${EXTRA_ARGS}
+    procd_set_param command "${PROG}" "$@"
     # Перезапуск при падении: не чаще 5 секунд, без ограничения числа попыток
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
