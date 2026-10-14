@@ -1,0 +1,37 @@
+[Unit]
+# Выходной узел OpenFlux на обычном сервере с systemd.
+#
+# Зачем он здесь, если задумывался на роутере: роутер не тянет. На восьми
+# полосах cups.online процессор Archer AX55 загружен под завязку (idle 8 %, из
+# них openflux 68 %), и дальше упор идёт в железо, а не в носитель. На сервере
+# того же упора нет — можно ставить шестнадцать полос и больше.
+#
+# Плата за перенос: трафик выходит с адреса сервера, а не из дома. Если нужен
+# именно домашний адрес, узел возвращают на роутер и мирятся со скоростью.
+Description=OpenFlux exit node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# URL= со списком комнат. Файл делают так, после первого запуска без него:
+#   echo "URL=$(cat /etc/openflux/rooms.txt)" > /etc/openflux/openflux.env
+EnvironmentFile=/etc/openflux/openflux.env
+# Число комнат = число полос, по которым размазан поток. Каждая отдаёт
+# 130-200 КБ/с, потолок ядра — 64.
+Environment=CUPS_ROOMS=16
+WorkingDirectory=/etc/openflux
+ExecStart=/usr/local/bin/openflux --role=exit --mode=l4 \
+    --transport=cupsonline --url=${URL} \
+    --encryption-key-file=/etc/openflux/secret.txt \
+    --cookie-store=/etc/openflux/cookies.json
+Restart=always
+RestartSec=5
+# Узел ходит только наружу, никаких прав ему не нужно.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/etc/openflux
+
+[Install]
+WantedBy=multi-user.target

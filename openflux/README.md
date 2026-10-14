@@ -268,3 +268,59 @@ iOS он держится, даже когда приложение закрыт
 новее 7 октября, в `openflux.env` меняются две строки — `TRANSPORT=mailru` и
 `URL=` со ссылкой на документ в облаке mail.ru, — и схема поедет на быстром
 носителе.
+
+## Если роутер не тянет: узел на сервере
+
+Замер на Archer AX55 под нагрузкой, восемь полос cups.online:
+
+```
+CPU:  63% usr  14% sys   0% nic   8% idle
+openflux  68%
+```
+
+То есть на восьми полосах упор уже в процессор роутера, и добавлять комнаты
+бессмысленно. Видео через такой канал не идёт.
+
+На сервере этого упора нет. Перенос, по шагам:
+
+```bash
+cd ~/OpenFlux
+go build -ldflags="-s -w" -o /usr/local/bin/openflux .
+mkdir -p /etc/openflux
+head -c 32 /dev/urandom | hexdump -v -e '/1 "%02x"' > /etc/openflux/secret.txt
+chmod 600 /etc/openflux/secret.txt
+
+# первый запуск без адреса — узел создаст комнаты и напечатает их список
+CUPS_ROOMS=16 /usr/local/bin/openflux --role=exit --mode=l4 \
+  --transport=cupsonline \
+  --encryption-key-file=/etc/openflux/secret.txt \
+  --cookie-store=/etc/openflux/cookies.json > /tmp/of.log 2>&1 &
+sleep 90
+grep -A1 "COPY THIS" /tmp/of.log | tail -1 > /etc/openflux/rooms.txt
+cat /etc/openflux/rooms.txt
+
+kill %1
+echo "URL=$(cat /etc/openflux/rooms.txt)" > /etc/openflux/openflux.env
+chmod 600 /etc/openflux/openflux.env
+cp openflux/openflux.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now openflux
+systemctl status openflux --no-pager
+```
+
+Список комнат и ключ — в приложение; транспорт тот же, Cups.online.
+
+Трафик при этом выходит с адреса сервера. Чтобы ютуб у телефона шёл без рекламы
+через московский выход, добавь службу в уже настроенную схему:
+
+```bash
+sudo bash noads-exit/route-service-output.sh openflux.service
+```
+
+Узел на роутере после переноса надо остановить, иначе два выхода будут драться
+за одни комнаты:
+
+```sh
+/etc/init.d/openflux stop
+/etc/init.d/openflux disable
+```
