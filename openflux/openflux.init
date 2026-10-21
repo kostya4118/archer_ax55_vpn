@@ -4,10 +4,18 @@
 #
 # Ставится в /etc/init.d/openflux, настройки читает из /etc/openflux/openflux.env.
 #
-# Запуск узла именно на роутере даёт то, ради чего всё затевалось: соединения
-# наружу открывает сам роутер, поэтому они идут по его обычной таблице
-# маршрутизации — через podkop со всеми его списками. Телефон на мобильном
-# интернете получает ту же маршрутизацию, что и устройства дома.
+# Соединения наружу узел открывает от имени самого роутера, и сами по себе они
+# мимо podkop проходят наполовину: podkop заворачивает по доменам через
+# поддельные адреса своего DNS, а клиенты OpenFlux имена разрешают у себя
+# (iPhone — через DNS-over-TLS напрямую, Mac — системным резолвером) и шлют в
+# туннель настоящие адреса. Узнаются только те, что лежат в списках подсетей.
+#
+# Поэтому при PODKOP_MARK=1 весь исходящий трафик узла помечается меткой
+# podkop и уходит в его sing-box через tproxy. Тот читает имя сайта из самого
+# соединения (sniff) и раскладывает по тем же спискам, что и трафик домашних
+# устройств; не попавшее ни в один уходит в direct-out. Чтобы nftables мог
+# отличить соединения узла от всего остального на роутере, узел запускается от
+# своего пользователя (RUN_AS).
 #
 USE_PROCD=1
 START=95
@@ -16,6 +24,33 @@ STOP=10
 PROG=/usr/bin/openflux
 CONF=/etc/openflux/openflux.env
 WORKDIR=/etc/openflux
+
+# Своя таблица, а не правила в таблице podkop: тот при каждом перезапуске
+# пересобирает свою таблицу целиком и наши правила бы стёр.
+NFT_TABLE=openflux_podkop
+PODKOP_FWMARK=0x00100000
+
+podkop_mark_on() {
+    local uid="$1"
+    nft delete table inet "${NFT_TABLE}" 2>/dev/null
+    # Обращения к самому роутеру и в домашние сети не трогаем: DNS узла идёт к
+    # AdGuard на 127.0.0.1, и с меткой он ушёл бы в tproxy и сам себя замкнул.
+    # 100.64.0.0/10 — адреса tailscale.
+    nft -f - <<EOF
+table inet ${NFT_TABLE} {
+    chain output {
+        type route hook output priority mangle - 1; policy accept;
+        meta skuid ${uid} ip daddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 } return
+        meta skuid ${uid} meta l4proto { tcp, udp } meta mark set ${PODKOP_FWMARK} counter
+    }
+}
+EOF
+}
+
+podkop_mark_off() {
+    nft delete table inet "${NFT_TABLE}" 2>/dev/null
+    return 0
+}
 
 start_service() {
     [ -x "${PROG}" ] || { echo "openflux: нет ${PROG}"; return 1; }
@@ -57,6 +92,27 @@ start_service() {
     # Режим l3 быстрее, но на роутере он ломает передачу — пакеты перестают
     # ходить вовсе, видимо из-за podkop и правил межсетевого экрана. Поэтому
     # по умолчанию l4; менять осознанно через MODE= в настройках.
+    # Пользователь, от которого работает узел. В режиме l4 права root ему не
+    # нужны: ни сырых сокетов, ни tun, только исходящие соединения и свои файлы.
+    RUN_UID=""
+    if [ -n "${RUN_AS}" ]; then
+        RUN_UID="$(id -u "${RUN_AS}" 2>/dev/null)"
+        [ -n "${RUN_UID}" ] || { echo "openflux: нет пользователя ${RUN_AS}"; return 1; }
+    fi
+
+    if [ "${PODKOP_MARK:-0}" = "1" ]; then
+        # Метить по uid можно только отдельного пользователя: от root на роутере
+        # ходит всё подряд, включая сам sing-box, и метка завернула бы его в
+        # собственный tproxy.
+        [ -n "${RUN_UID}" ] && [ "${RUN_UID}" != "0" ] || {
+            echo "openflux: PODKOP_MARK=1 требует RUN_AS с отдельным пользователем"
+            return 1
+        }
+        podkop_mark_on "${RUN_UID}" || { echo "openflux: не удалось поставить правила nftables"; return 1; }
+    else
+        podkop_mark_off
+    fi
+
     set -- --role=exit --mode="${MODE:-l4}" ${TRANSPORT_ARG} \
         --encryption-key-file="${KEYFILE}" \
         --cookie-store="${WORKDIR}/cookies.json"
@@ -64,6 +120,7 @@ start_service() {
     [ -n "${EXTRA_ARGS}" ] && set -- "$@" ${EXTRA_ARGS}
 
     procd_open_instance openflux
+    [ -n "${RUN_AS}" ] && procd_set_param user "${RUN_AS}"
     # Переменные окружения из настроек, через пробел. Ими задаются вещи, под
     # которые нет флагов: главное — CUPS_ROOMS, число комнат у cupsonline, а в
     # новом режиме это число полос, по которым размазан поток. По умолчанию их
@@ -81,6 +138,10 @@ start_service() {
     procd_set_param stderr 1
     procd_set_param pidfile /var/run/openflux.pid
     procd_close_instance
+}
+
+stop_service() {
+    podkop_mark_off
 }
 
 service_triggers() {
