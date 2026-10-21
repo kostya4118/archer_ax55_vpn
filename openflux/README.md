@@ -324,3 +324,32 @@ sudo bash noads-exit/route-service-output.sh openflux.service
 /etc/init.d/openflux stop
 /etc/init.d/openflux disable
 ```
+
+## Вход в учётную запись для mail.ru
+
+С 15 октября mail.ru закрыл анонимный доступ к публичным документам
+([#193](https://github.com/p1neappleXpress/OpenFlux/issues/193)): узел получает
+`401`, а с ядра `v0.14.2` — `400` на `fetchDocInfo`. Нужен вход.
+
+Ядро читает его из файла `--cookie-store`. Формат — JSON вида
+`{"<ссылка на документ>": {"имя": "значение", ...}}`, где ключ верхнего уровня
+ровно та же строка, что стоит в `URL=`.
+
+Порядок:
+
+1. В браузере, где выполнен вход в mail.ru, открыть документ и выгрузить
+   cookies расширением вроде «Get cookies.txt LOCALLY» (формат Netscape).
+2. Превратить выгрузку в хранилище:
+
+```bash
+python3 openflux/cookies-to-store.py cookies.txt \
+    --url https://cloud.mail.ru/public/XXXX/YYYY \
+    --domain mail.ru --out cookies.json
+```
+
+3. Положить файл на узел как `/etc/openflux/cookies.json` с правами 600 и
+   перезапустить службу.
+
+Файл — это действующая сессия учётной записи mail.ru: пересылать его нельзя, а
+на узле он должен быть доступен только root. С ядра `v0.14.3` узел не отдаёт
+свой вход клиентам, так что дальше него он не уходит.
